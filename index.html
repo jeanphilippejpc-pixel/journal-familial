@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#F6F7FB">
+<meta name="robots" content="noindex, nofollow">
+<title>Journal familial</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="lock" class="lock" hidden></div>
+<div id="shell" class="shell" hidden>
+  <header class="top">
+    <div class="top-titles">
+      <span class="sub" id="topSub">Journal familial</span>
+      <h1 id="topTitle">Calendrier</h1>
+    </div>
+    <button type="button" class="icon-btn" data-act="nav" data-view="settings" aria-label="Paramètres" id="gearBtn"></button>
+  </header>
+  <main id="view" class="view" tabindex="-1"></main>
+  <nav class="bottom" aria-label="Navigation principale" id="bottomNav"></nav>
+</div>
+<div id="sheet-root"></div>
+<div id="modal-root"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<noscript>Cette application nécessite JavaScript.</noscript>
+<script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,836 @@
+/* Journal familial — application (phase 2 : fonctionnement local)
+ * Aucune bibliothèque externe. Aucune donnée n'est envoyée sur Internet dans cette phase.
+ * Les observations sont chiffrées (AES-GCM 256) avant d'être écrites dans le stockage du navigateur.
+ */
+(() => {
+  'use strict';
+
+  // ---------- Constantes ----------
+  const APP_VERSION = '0.2.0';
+  const DB_NAME = 'journal-familial';
+  const NEUTRAL_TITLE = 'Journal familial';
+  const DB_VER = 1;
+  const PIN_ITER = 200000;
+  const EXPORT_ITER = 310000;
+  const TRASH_DAYS = 30;
+  const BACKUP_REMINDER_DAYS = 30;
+  const MIN_YEAR = 2026;
+
+  const COLORS = ['vert', 'jaune', 'orange', 'rouge'];
+  const RANK = { vert: 0, jaune: 1, orange: 2, rouge: 3 };
+  const COLOR_LABEL = { vert: 'Vert', jaune: 'Jaune', orange: 'Orange', rouge: 'Rouge' };
+  const COLOR_DESC = { vert: 'Très belle', jaune: 'Mineure', orange: 'Modérée', rouge: 'Intense' };
+  const TYPES = { difficulte: 'Difficulté', crise: 'Crise', reussite: 'Réussite', beau_moment: 'Beau moment', autre: 'Autre' };
+  const HARD_TYPES = ['difficulte', 'crise'];
+  const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+  const DOW = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+  const PLACES = ['Maison', 'École', 'Garderie', 'Voiture', 'Sortie', 'Parc', 'Chez la famille', 'Magasin'];
+  const DETAIL_FIELDS = [
+    ['duration', 'Durée approximative (minutes)', 'number'],
+    ['place', 'Endroit', 'place'],
+    ['people', 'Personnes présentes', 'text'],
+    ['stateBefore', 'État apparent {de_enfant} avant', 'text'],
+    ['context', 'Contexte et déclencheur possible', 'area'],
+    ['description', 'Description factuelle', 'area'],
+    ['adultReaction', 'Réaction des adultes', 'area'],
+    ['intervention', 'Intervention utilisée', 'area'],
+    ['childReaction', 'Réaction {de_enfant}', 'area'],
+    ['calmTime', 'Temps pour retrouver le calme (minutes)', 'number'],
+    ['helped', 'Ce qui semble avoir aidé', 'area'],
+    ['extra', 'Notes supplémentaires', 'area'],
+  ];
+
+  // ---------- Icônes (SVG en trait) ----------
+  const P = {
+    cal: '<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+    book: '<path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z"/><path d="M5 17a3 3 0 0 1 3-3h11"/>',
+    chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+    doc: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>',
+    gear: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>',
+    left: '<path d="M15 6l-6 6 6 6"/>', right: '<path d="M9 6l6 6-6 6"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>', x: '<path d="M6 6l12 12M18 6L6 18"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+    star: '<path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4 6.7 19.4l1.2-6L3.4 9.3l6-.7z"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
+    lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    back: '<path d="M21 5H9l-6 7 6 7h12z"/><path d="M17 9l-5 6M12 9l5 6"/>',
+  };
+  const ico = (name, size = 22) => `<svg aria-hidden="true" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${P[name]}</svg>`;
+
+  // ---------- Utilitaires ----------
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const pad = (n) => String(n).padStart(2, '0');
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const today = () => ymd(new Date());
+  const nowTime = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const parseYmd = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const fmtLong = (s) => { const d = parseYmd(s); return `${cap(DOW[d.getDay()])} ${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`; };
+  const fmtShort = (s) => { const d = parseYmd(s); return `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 4).replace(/\.$/, '')}.`; };
+  const fmtTime = (t) => (t ? t.replace(':', ' h ') : '');
+  const fmtStamp = (iso) => { if (!iso) return ''; const d = new Date(iso); return `${d.getDate()} ${MONTHS[d.getMonth()]} à ${pad(d.getHours())} h ${pad(d.getMinutes())}`; };
+  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join(''));
+  const nowIso = () => new Date().toISOString();
+  const b64 = (buf) => { const a = new Uint8Array(buf); let s = ''; for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000)); return btoa(s); };
+  const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  // ---------- Stockage (IndexedDB) ----------
+  let dbPromise = null;
+  function db() {
+    if (!dbPromise) {
+      dbPromise = new Promise((resolve, reject) => {
+        const r = indexedDB.open(DB_NAME, DB_VER);
+        r.onupgradeneeded = () => {
+          const d = r.result;
+          if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta');
+          if (!d.objectStoreNames.contains('records')) d.createObjectStore('records', { keyPath: 'id' });
+        };
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+    }
+    return dbPromise;
+  }
+  function txDone(t) { return new Promise((res, rej) => { t.oncomplete = () => res(); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); }); }
+  async function metaGet(k) { const d = await db(); return new Promise((res, rej) => { const r = d.transaction('meta').objectStore('meta').get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+  async function metaSet(k, v) { const d = await db(); const t = d.transaction('meta', 'readwrite'); t.objectStore('meta').put(v, k); return txDone(t); }
+  async function recAll() { const d = await db(); return new Promise((res, rej) => { const r = d.transaction('records').objectStore('records').getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+  async function recPut(list) { const d = await db(); const t = d.transaction('records', 'readwrite'); const s = t.objectStore('records'); list.forEach((x) => s.put(x)); return txDone(t); }
+  async function recDelete(ids) { const d = await db(); const t = d.transaction('records', 'readwrite'); const s = t.objectStore('records'); ids.forEach((id) => s.delete(id)); return txDone(t); }
+  async function wipeAll() {
+    try { const d = await db(); d.close(); } catch (e) { /* rien */ }
+    dbPromise = null;
+    await new Promise((res) => { const r = indexedDB.deleteDatabase(DB_NAME); r.onsuccess = r.onerror = r.onblocked = () => res(); });
+    try { localStorage.clear(); sessionStorage.clear(); } catch (e) { /* rien */ }
+  }
+
+  // ---------- Chiffrement ----------
+  let DEK = null; // clé de données, en mémoire seulement quand l'app est déverrouillée
+  async function loadDek() {
+    let k = await metaGet('dek');
+    if (!k) {
+      // Clé non exportable : le JavaScript peut l'utiliser mais jamais lire ses octets.
+      k = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      await metaSet('dek', k);
+    }
+    return k;
+  }
+  async function seal(obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, DEK, enc.encode(JSON.stringify(obj)));
+    return { id: obj.id, iv, ct };
+  }
+  async function unseal(rec) {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: rec.iv }, DEK, rec.ct);
+    return JSON.parse(dec.decode(pt));
+  }
+  async function pbkdf2(secret, salt, iter) {
+    const base = await crypto.subtle.importKey('raw', enc.encode(secret), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
+    return { base, bits: async () => new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter }, base, 256)) };
+  }
+  async function pinHash(pin, salt, iter) { return (await pbkdf2(pin, salt, iter)).bits(); }
+  function sameBytes(a, b) { if (a.length !== b.length) return false; let x = 0; for (let i = 0; i < a.length; i++) x |= a[i] ^ b[i]; return x === 0; }
+  async function passwordKey(password, salt, iter) {
+    const { base } = await pbkdf2(password, salt, iter);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+
+  // ---------- État ----------
+  const S = {
+    unlocked: false,
+    events: new Map(),
+    days: new Map(), // date -> jour
+    settings: null,
+    view: 'calendar',
+    month: null, // {y, m}
+    selected: today(),
+    jFilter: 'tous',
+    jQuery: '',
+  };
+  const defaultSettings = () => ({ id: 'settings', kind: 'settings', parent: '', lastExport: null, createdAt: nowIso() });
+
+  async function loadAll() {
+    S.events.clear(); S.days.clear();
+    S.settings = null;
+    const recs = await recAll();
+    for (const r of recs) {
+      let o;
+      try { o = await unseal(r); } catch (e) { console.warn('Enregistrement illisible ignoré'); continue; }
+      if (o.kind === 'event') S.events.set(o.id, o);
+      else if (o.kind === 'day') { const ex = S.days.get(o.date); if (!ex || ex.updatedAt < o.updatedAt) S.days.set(o.date, o); }
+      else if (o.kind === 'settings') S.settings = o;
+    }
+    if (!S.settings) { S.settings = defaultSettings(); await saveSettings(); }
+    await purgeTrash();
+  }
+  async function saveRecord(o) { await recPut([await seal(o)]); }
+  async function saveSettings() { await saveRecord(S.settings); }
+  async function saveEvent(ev, { touch = true } = {}) {
+    if (touch) { ev.updatedAt = nowIso(); ev.updatedBy = S.settings.parent || ''; ev.version = (ev.version || 0) + 1; }
+    S.events.set(ev.id, ev);
+    await saveRecord(ev);
+  }
+  async function saveDay(day) {
+    day.updatedAt = nowIso(); day.updatedBy = S.settings.parent || ''; day.version = (day.version || 0) + 1;
+    S.days.set(day.date, day);
+    await saveRecord(day);
+  }
+  function getDay(date) { return S.days.get(date) || { id: uid(), kind: 'day', date, rating: null, belle: false, createdAt: nowIso() }; }
+  async function purgeTrash() {
+    const limit = Date.now() - TRASH_DAYS * 864e5;
+    const old = [...S.events.values()].filter((e) => e.deletedAt && Date.parse(e.deletedAt) < limit);
+    if (old.length) { old.forEach((e) => S.events.delete(e.id)); await recDelete(old.map((e) => e.id)); }
+  }
+
+  // ---------- Prénom (paramètre privé, chiffré ; jamais dans le code public) ----------
+  const childName = () => ((S.settings && S.settings.childName) || '').trim();
+  const deChild = () => { const n = childName(); return n ? (/^[aeiouyhâàéèêîôûAEIOUYHÂÀÉÈÊÎÔÛ]/.test(n) ? `d'${n}` : `de ${n}`) : "de l'enfant"; };
+  const appTitle = () => (childName() ? `Journal ${deChild()}` : NEUTRAL_TITLE);
+  const fieldLabel = (l) => l.replace('{de_enfant}', deChild());
+  function applyTitles(unlocked) { const t = unlocked ? appTitle() : NEUTRAL_TITLE; document.title = t; const s = $('#topSub'); if (s) s.textContent = t; }
+
+  // ---------- Règles métier ----------
+  const liveEvents = () => [...S.events.values()].filter((e) => !e.deletedAt);
+  const sortEv = (a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || ''));
+  const eventsOn = (date) => liveEvents().filter((e) => e.date === date).sort(sortEv);
+  function isIncomplete(e) {
+    if (e.markedComplete) return false;
+    if (!e.type) return true;
+    if (HARD_TYPES.includes(e.type)) return !e.intensity || !(e.description || e.note);
+    return false;
+  }
+  function suggestColor(date) {
+    let best = null;
+    for (const e of eventsOn(date)) if (e.intensity && (best === null || RANK[e.intensity] > RANK[best])) best = e.intensity;
+    return best;
+  }
+  function evTitle(e) {
+    const t = e.type ? TYPES[e.type] : 'Événement';
+    return e.intensity && e.type !== 'reussite' && e.type !== 'beau_moment' ? `${t} · ${COLOR_DESC[e.intensity].toLowerCase()}` : t;
+  }
+  function evText(e) { return e.note || e.description || e.context || ''; }
+  const isPositive = (e) => e.type === 'reussite' || e.type === 'beau_moment';
+
+  // ---------- Interface commune ----------
+  const view = () => $('#view');
+  function toast(msg, action) {
+    const t = $('#toast');
+    t.innerHTML = `<span>${esc(msg)}</span>${action ? `<button type="button" id="toastAct">${esc(action.label)}</button>` : ''}`;
+    t.hidden = false;
+    clearTimeout(toast._t);
+    if (action) $('#toastAct').onclick = () => { t.hidden = true; action.run(); };
+    toast._t = setTimeout(() => { t.hidden = true; }, action ? 6000 : 2800);
+  }
+  function ask({ title, text = '', ok = 'Confirmer', cancel = 'Annuler', danger = false, input = null }) {
+    return new Promise((resolve) => {
+      const root = $('#modal-root');
+      root.innerHTML = `<div class="modal-wrap" role="dialog" aria-modal="true" aria-labelledby="mTitle"><div class="modal">
+        <h2 id="mTitle">${esc(title)}</h2>${text ? `<p>${text}</p>` : ''}
+        ${input ? `<label class="field"><span class="lbl">${esc(input.label)}</span><input class="input" id="mInput" type="${input.type || 'text'}" autocomplete="off" ${input.mode ? `inputmode="${input.mode}"` : ''}></label>` : ''}
+        ${input && input.confirm ? `<label class="field"><span class="lbl">${esc(input.confirm)}</span><input class="input" id="mInput2" type="${input.type || 'text'}" autocomplete="off"></label>` : ''}
+        <p class="small" id="mErr" hidden></p>
+        <div class="actions">${cancel ? `<button type="button" class="btn quiet small" id="mNo">${esc(cancel)}</button>` : ''}<button type="button" class="btn small ${danger ? 'danger' : ''}" id="mYes">${esc(ok)}</button></div>
+      </div></div>`;
+      const close = (v) => { root.innerHTML = ''; resolve(v); };
+      const inp = $('#mInput');
+      if (inp) setTimeout(() => inp.focus(), 50);
+      if ($('#mNo')) $('#mNo').onclick = () => close(null);
+      $('#mYes').onclick = () => {
+        if (!input) return close(true);
+        const v = inp.value;
+        if (input.validate) { const err = input.validate(v, $('#mInput2') ? $('#mInput2').value : undefined); if (err) { const e = $('#mErr'); e.textContent = err; e.hidden = false; return; } }
+        close(v);
+      };
+    });
+  }
+  function closeSheets() { $('#sheet-root').innerHTML = ''; }
+
+  function renderNav() {
+    const tabs = [['calendar', 'Calendrier', 'cal'], ['journal', 'Journal', 'book'], null, ['evolution', 'Évolution', 'chart'], ['reports', 'Rapports', 'doc']];
+    $('#bottomNav').innerHTML = tabs.map((t) => t
+      ? `<button type="button" class="tab" data-act="nav" data-view="${t[0]}" ${S.view === t[0] ? 'aria-current="page"' : ''}>${ico(t[2])}<span>${t[1]}</span></button>`
+      : `<button type="button" class="fab" data-act="quick" aria-label="Ajouter un événement">${ico('plus', 28)}</button>`).join('');
+    $('#gearBtn').innerHTML = ico('gear', 20);
+  }
+  const TITLES = { calendar: 'Calendrier', journal: 'Journal', evolution: 'Évolution', reports: 'Rapports', settings: 'Paramètres' };
+  function render() {
+    if (!S.unlocked) return;
+    $('#topTitle').textContent = TITLES[S.view];
+    applyTitles(true);
+    renderNav();
+    if (S.view === 'calendar') renderCalendar();
+    else if (S.view === 'journal') renderJournal();
+    else if (S.view === 'settings') renderSettings();
+    else renderPlaceholder();
+  }
+
+  // ---------- Calendrier ----------
+  function backupBanner() {
+    const n = liveEvents().length + S.days.size;
+    if (!n) return '';
+    const last = S.settings.lastExport ? Date.parse(S.settings.lastExport) : null;
+    if (last && Date.now() - last < BACKUP_REMINDER_DAYS * 864e5) return '';
+    const txt = last ? `Dernière sauvegarde il y a ${Math.floor((Date.now() - last) / 864e5)} jours.` : 'Aucune sauvegarde n\'a encore été faite.';
+    return `<div class="banner warn"><span class="spacer">${txt}</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Sauvegarder</button></div>`;
+  }
+  function renderCalendar() {
+    if (!S.month) { const d = parseYmd(S.selected); S.month = { y: d.getFullYear(), m: d.getMonth() }; }
+    const { y, m } = S.month;
+    const first = new Date(y, m, 1);
+    const daysIn = new Date(y, m + 1, 0).getDate();
+    const t = today();
+    let cells = ['D', 'L', 'M', 'M', 'J', 'V', 'S'].map((x, i) => `<span class="dow" aria-hidden="true" title="${DOW[i]}">${x}</span>`).join('');
+    for (let i = 0; i < first.getDay(); i++) cells += '<span class="day empty" aria-hidden="true"></span>';
+    for (let d = 1; d <= daysIn; d++) {
+      const date = `${y}-${pad(m + 1)}-${pad(d)}`;
+      const day = S.days.get(date);
+      const evs = eventsOn(date);
+      const cls = ['day'];
+      let state = '';
+      if (day && day.rating) { cls.push('c-' + day.rating); state = `journée ${COLOR_LABEL[day.rating].toLowerCase()}`; }
+      else if (evs.length) { cls.push('obs'); state = 'observations, journée non évaluée'; }
+      else if (date < t) { cls.push('none'); state = 'aucune observation'; }
+      if (date === t) cls.push('today');
+      if (date === S.selected) cls.push('sel');
+      const pos = evs.some(isPositive) || (day && day.belle);
+      const todo = evs.some(isIncomplete);
+      const marks = `<span class="marks">${pos ? '<span class="mark"></span>' : ''}${todo ? '<span class="mark todo"></span>' : ''}</span>`;
+      cells += `<button type="button" class="${cls.join(' ')}" data-act="pick" data-date="${date}" aria-label="${d} ${MONTHS[m]}${state ? ', ' + state : ''}${date === t ? ", aujourd'hui" : ''}" ${date === S.selected ? 'aria-pressed="true"' : ''}>${d}${marks}</button>`;
+    }
+    const canPrev = !(y === MIN_YEAR && m === 0);
+    const legend = COLORS.map((c) => `<span><i class="sw c-${c}"></i>${COLOR_LABEL[c]}</span>`).join('') + '<span><i class="sw none"></i>Aucune observation</span><span><i class="mark"></i>Réussite</span><span><i class="mark todo"></i>À compléter</span>';
+    view().innerHTML = `${backupBanner()}
+      <section class="card" aria-label="Calendrier du mois">
+        <div class="cal-head">
+          <button type="button" class="icon-btn plain" data-act="month" data-d="-1" aria-label="Mois précédent" ${canPrev ? '' : 'disabled'}>${ico('left', 20)}</button>
+          <span class="month" aria-live="polite">${MONTHS[m]} ${y}</span>
+          <button type="button" class="icon-btn plain" data-act="month" data-d="1" aria-label="Mois suivant">${ico('right', 20)}</button>
+        </div>
+        <div class="cal-grid">${cells}</div>
+        <div class="legend">${legend}</div>
+      </section>
+      <div class="chips"><button type="button" class="btn small quiet" data-act="today">Aujourd'hui</button></div>
+      ${dayCard(S.selected)}`;
+  }
+  function dayCard(date) {
+    const day = S.days.get(date);
+    const evs = eventsOn(date);
+    const sug = suggestColor(date);
+    const rating = day ? day.rating : null;
+    const rateBtns = COLORS.map((c) => `<button type="button" class="rate c-${c}" role="radio" aria-checked="${rating === c}" data-act="rate" data-c="${c}">${COLOR_LABEL[c]}</button>`).join('')
+      + `<button type="button" class="rate none" role="radio" aria-checked="${!rating}" data-act="rate" data-c="">Non évaluée</button>`;
+    let sugLine = '';
+    if (sug && sug !== rating) sugLine = `<p class="hint">Suggestion : ${COLOR_LABEL[sug].toLowerCase()} (l'événement le plus intense de la journée). <button type="button" class="linkish" data-act="rate" data-c="${sug}">Appliquer</button></p>`;
+    else if (sug && sug === rating) sugLine = '<p class="hint">Correspond à l\'événement le plus intense de la journée.</p>';
+    const isFuture = date > today();
+    const belle = day && day.belle;
+    return `<section class="card" aria-label="Journée sélectionnée">
+      <div class="row"><strong class="spacer">${fmtLong(date)}</strong></div>
+      ${isFuture ? '<p class="hint">Journée à venir.</p>' : `
+      <div class="row wrap"><button type="button" class="btn-belle" data-act="belle" aria-pressed="${!!belle}">${ico('star', 18)}${belle ? 'Belle journée ✓' : 'Belle journée'}</button><span class="hint">Un toucher : journée verte, sans fiche.</span></div>
+      <span class="lbl">Couleur de la journée</span>
+      <div class="rating" role="radiogroup" aria-label="Couleur de la journée">${rateBtns}</div>${sugLine}`}
+      <span class="lbl">Événements</span>
+      <div class="list">${evs.length ? evs.map((e) => evRow(e)).join('') : '<p class="empty-note">Aucun événement noté pour cette journée.</p>'}</div>
+      <button type="button" class="btn ghost block" data-act="quick" data-date="${date}">${ico('plus', 18)}Ajouter un événement ce jour-là</button>
+    </section>`;
+  }
+  function evRow(e, onWhite = false, showDate = false) {
+    const who = e.author ? ` · ${esc(e.author)}` : '';
+    return `<button type="button" class="ev${onWhite ? ' on-white' : ''}" data-act="open" data-id="${e.id}">
+      <span class="bar ${e.intensity ? 'c-' + e.intensity : ''}"></span>
+      <span class="body"><span class="meta"><span class="kind">${esc(evTitle(e))}</span><span>${showDate ? fmtShort(e.date) + ' · ' : ''}${fmtTime(e.time)}${who}</span></span>
+      ${evText(e) ? `<span class="txt">${esc(evText(e))}</span>` : ''}
+      ${isIncomplete(e) ? '<span class="todo-tag">À compléter</span>' : ''}</span></button>`;
+  }
+
+  // ---------- Ajout rapide ----------
+  function openQuick(date) {
+    const d = date || (S.view === 'calendar' ? S.selected : today());
+    const q = { date: d > today() ? today() : d, time: nowTime(), intensity: null, type: null };
+    const root = $('#sheet-root');
+    root.innerHTML = `<div class="overlay" data-act="closeSheet"><section class="sheet" role="dialog" aria-modal="true" aria-labelledby="qTitle">
+      <span class="grab"></span>
+      <div class="sheet-head"><h2 id="qTitle">Nouvel événement</h2><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Fermer">${ico('x', 20)}</button></div>
+      <div class="two"><label class="field"><span class="lbl">Date</span><input class="input" type="date" id="qDate" value="${q.date}" min="${MIN_YEAR}-01-01" max="${today()}"></label>
+      <label class="field"><span class="lbl">Heure</span><input class="input" type="time" id="qTime" value="${q.time}"></label></div>
+      <div class="field"><span class="lbl">1. Intensité</span><div class="swatches">${COLORS.map((c) => `<button type="button" class="swatch c-${c}" data-q="intensity" data-v="${c}" aria-pressed="false">${COLOR_LABEL[c]}<small>${COLOR_DESC[c]}</small></button>`).join('')}</div></div>
+      <div class="field"><span class="lbl">2. Type</span><div class="row wrap">${Object.entries(TYPES).map(([k, v]) => `<button type="button" class="pill" data-q="type" data-v="${k}" aria-pressed="false">${v}</button>`).join('')}</div></div>
+      <div class="field"><label class="lbl" for="qNote">3. Note (facultatif)</label>
+        <textarea class="input" id="qNote" rows="3" placeholder="Ce qui s'est passé, en quelques mots…"></textarea>
+        <button type="button" class="btn soft block" data-act="dictate">${ico('mic', 22)}Dicter la note</button>
+        <p class="hint">Le clavier s'ouvre : touchez ensuite son micro. Selon le téléphone, la dictée ne démarre pas toute seule.</p></div>
+      <button type="button" class="btn block" id="qSave">Enregistrer</button>
+      <p class="hint">Une intensité, un type ou une note suffit. Vous pourrez compléter plus tard.</p>
+    </section></div>`;
+    $('.sheet', root).addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const b = ev.target.closest('[data-q]');
+      if (b) {
+        const key = b.dataset.q; const val = b.dataset.v;
+        q[key] = q[key] === val ? null : val;
+        $$(`[data-q="${key}"]`, root).forEach((x) => x.setAttribute('aria-pressed', String(q[key] === x.dataset.v)));
+        return;
+      }
+      const a = ev.target.closest('[data-act]');
+      if (a) handleAct(a, ev);
+    });
+    $('#qSave').onclick = async () => {
+      const note = $('#qNote').value.trim();
+      if (!q.intensity && !q.type && !note) { toast('Choisissez au moins une intensité, un type ou écrivez une note.'); return; }
+      const ev = { id: uid(), kind: 'event', date: $('#qDate').value || today(), time: $('#qTime').value || '', type: q.type, intensity: q.intensity, note, author: S.settings.parent || '', createdAt: nowIso(), comments: [] };
+      await saveEvent(ev);
+      closeSheets();
+      S.selected = ev.date; S.month = null;
+      if (S.view !== 'journal') S.view = 'calendar';
+      render();
+      toast(isIncomplete(ev) ? 'Enregistré · à compléter plus tard' : 'Événement enregistré', { label: 'Détails', run: () => openDetail(ev.id) });
+    };
+  }
+
+  // ---------- Fiche détaillée ----------
+  function openDetail(id) {
+    const e = S.events.get(id);
+    if (!e) return;
+    const draft = JSON.parse(JSON.stringify(e));
+    const root = $('#sheet-root');
+    const fieldHtml = DETAIL_FIELDS.map(([k, rawLabel, kind]) => {
+      const label = esc(fieldLabel(rawLabel));
+      const v = esc(draft[k] ?? '');
+      if (kind === 'area') return `<label class="field"><span class="lbl">${label}</span><textarea class="input" rows="2" data-f="${k}">${v}</textarea></label>`;
+      if (kind === 'number') return `<label class="field"><span class="lbl">${label}</span><input class="input" type="number" min="0" max="1440" inputmode="numeric" data-f="${k}" value="${v}"></label>`;
+      if (kind === 'place') return `<label class="field"><span class="lbl">${label}</span><input class="input" list="placesList" data-f="${k}" value="${v}"><datalist id="placesList">${PLACES.map((p) => `<option value="${p}"></option>`).join('')}</datalist></label>`;
+      return `<label class="field"><span class="lbl">${label}</span><input class="input" data-f="${k}" value="${v}"></label>`;
+    }).join('');
+    const comments = (draft.comments || []).map((c) => `<div class="comment"><strong>${esc(c.author || 'Parent')}</strong> <span class="small muted">${fmtStamp(c.at)}</span><br>${esc(c.text)}</div>`).join('');
+    root.innerHTML = `<div class="panel" role="dialog" aria-modal="true" aria-labelledby="dTitle"><div class="panel-inner">
+      <div class="panel-head"><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="dTitle">Fiche de l'événement</span><button type="button" class="btn small" id="dSave">Enregistrer</button></div>
+      <section class="card">
+        <div class="row wrap">${e.intensity ? `<span class="chip-tag c-${e.intensity}">${COLOR_LABEL[e.intensity]} · ${COLOR_DESC[e.intensity]}</span>` : ''}${e.type ? `<span class="chip-tag">${TYPES[e.type]}</span>` : ''}${isIncomplete(e) ? '<span class="chip-tag outline">À compléter</span>' : ''}</div>
+        <p class="hint">Noté par ${esc(e.author || 'un parent')} le ${fmtStamp(e.createdAt)}${e.updatedAt && e.updatedAt !== e.createdAt && e.version > 1 ? ` · modifié${e.updatedBy ? ' par ' + esc(e.updatedBy) : ''} le ${fmtStamp(e.updatedAt)}` : ''}</p>
+        <div class="two"><label class="field"><span class="lbl">Date</span><input class="input" type="date" data-f="date" value="${esc(draft.date)}" min="${MIN_YEAR}-01-01"></label>
+        <label class="field"><span class="lbl">Heure</span><input class="input" type="time" data-f="time" value="${esc(draft.time || '')}"></label></div>
+        <div class="field"><span class="lbl">Intensité</span><div class="swatches">${COLORS.map((c) => `<button type="button" class="swatch c-${c}" data-d="intensity" data-v="${c}" aria-pressed="${draft.intensity === c}">${COLOR_LABEL[c]}<small>${COLOR_DESC[c]}</small></button>`).join('')}</div></div>
+        <div class="field"><span class="lbl">Type</span><div class="row wrap">${Object.entries(TYPES).map(([k, v]) => `<button type="button" class="pill" data-d="type" data-v="${k}" aria-pressed="${draft.type === k}">${v}</button>`).join('')}</div></div>
+        <label class="field"><span class="lbl">Note rapide</span><textarea class="input" rows="3" data-f="note">${esc(draft.note || '')}</textarea></label>
+        <p class="hint">Tous les champs ci-dessous sont facultatifs.</p>
+        ${fieldHtml}
+        <label class="check"><input type="checkbox" id="dComplete" ${draft.markedComplete ? 'checked' : ''}> Fiche complète (retirer « À compléter »)</label>
+      </section>
+      <section class="card"><h3 class="card-title">Commentaires</h3>${comments || '<p class="empty-note">Aucun commentaire.</p>'}
+        <label class="field"><span class="sr">Nouveau commentaire</span><textarea class="input" rows="2" id="dComment" placeholder="Ajouter une information complémentaire…"></textarea></label>
+        <button type="button" class="btn quiet" id="dAddComment">Ajouter le commentaire</button></section>
+      <section class="card"><button type="button" class="btn danger-ghost block" id="dDelete">Supprimer cet événement</button><p class="hint">L'événement va dans la corbeille pendant 30 jours avant d'être effacé.</p></section>
+    </div></div>`;
+    const panel = $('.panel', root);
+    const snap = () => JSON.stringify([draft.intensity, draft.type, ...$$('[data-f]', panel).map((i) => i.value), $('#dComplete').checked, $('#dComment').value]);
+    const initial = snap();
+    panel.addEventListener('click', async (ev) => {
+      const back = ev.target.closest('[data-act="closeSheet"]');
+      if (back) {
+        if (snap() !== initial && !(await ask({ title: 'Quitter sans enregistrer ?', text: 'Vos modifications de cette fiche seront perdues.', ok: 'Quitter', danger: true }))) return;
+        closeSheets(); return;
+      }
+      const b = ev.target.closest('[data-d]');
+      if (b) { const k = b.dataset.d; draft[k] = draft[k] === b.dataset.v ? null : b.dataset.v; $$(`[data-d="${k}"]`, panel).forEach((x) => x.setAttribute('aria-pressed', String(draft[k] === x.dataset.v))); return; }
+      const a = ev.target.closest('[data-act]');
+      if (a) handleAct(a, ev);
+    });
+    const collect = () => {
+      $$('[data-f]', panel).forEach((inp) => {
+        const k = inp.dataset.f; let v = inp.value.trim();
+        if (inp.type === 'number') v = v === '' ? '' : String(Math.max(0, Math.min(1440, Math.round(Number(v)) || 0)));
+        draft[k] = v;
+      });
+      draft.markedComplete = $('#dComplete').checked;
+    };
+    $('#dSave').onclick = async () => {
+      collect();
+      if (!draft.date) { toast('La date est obligatoire.'); return; }
+      const cur = S.events.get(id);
+      Object.assign(cur, draft, { comments: cur.comments || [] });
+      await saveEvent(cur);
+      closeSheets(); S.selected = cur.date; S.month = null; render();
+      toast('Fiche enregistrée');
+    };
+    $('#dAddComment').onclick = async () => {
+      const text = $('#dComment').value.trim();
+      if (!text) return;
+      const cur = S.events.get(id);
+      cur.comments = [...(cur.comments || []), { id: uid(), author: S.settings.parent || '', text, at: nowIso() }];
+      await saveEvent(cur);
+      collect();
+      const keep = { ...draft };
+      openDetail(id);
+      // conserve les modifications non enregistrées de la fiche
+      $$('[data-f]', $('.panel')).forEach((inp) => { if (keep[inp.dataset.f] !== undefined) inp.value = keep[inp.dataset.f]; });
+      toast('Commentaire ajouté');
+    };
+    $('#dDelete').onclick = async () => {
+      const ok = await ask({ title: 'Supprimer cet événement ?', text: 'Il sera placé dans la corbeille pendant 30 jours. Vous pourrez le restaurer depuis les Paramètres.', ok: 'Supprimer', danger: true });
+      if (!ok) return;
+      const cur = S.events.get(id);
+      cur.deletedAt = nowIso();
+      await saveEvent(cur);
+      closeSheets(); render();
+      toast('Événement supprimé', { label: 'Annuler', run: async () => { delete cur.deletedAt; await saveEvent(cur); render(); } });
+    };
+  }
+
+  // ---------- Journal ----------
+  function renderJournal() {
+    const filters = [['tous', 'Tout'], ['todo', 'À compléter'], ['hard', 'Difficultés et crises'], ['intense', 'Crises intenses'], ['pos', 'Réussites et beaux moments']];
+    const q = S.jQuery.toLowerCase();
+    let list = liveEvents();
+    if (S.jFilter === 'todo') list = list.filter(isIncomplete);
+    if (S.jFilter === 'hard') list = list.filter((e) => HARD_TYPES.includes(e.type));
+    if (S.jFilter === 'intense') list = list.filter((e) => e.intensity === 'rouge');
+    if (S.jFilter === 'pos') list = list.filter(isPositive);
+    if (q) list = list.filter((e) => [e.note, e.place, e.people, e.context, e.description, e.intervention, e.helped, e.extra, e.childReaction, e.adultReaction, e.stateBefore, TYPES[e.type]].join(' ').toLowerCase().includes(q));
+    list.sort((a, b) => sortEv(b, a));
+    let html = `<div class="search">${ico('search', 20)}<label class="sr" for="jq">Rechercher</label><input id="jq" type="search" placeholder="Rechercher (ex. : parc, transition, école)" value="${esc(S.jQuery)}"></div>
+      <div class="chips">${filters.map(([k, l]) => `<button type="button" class="pill" data-act="jf" data-f="${k}" aria-pressed="${S.jFilter === k}">${l}</button>`).join('')}</div>`;
+    if (!list.length) html += '<div class="placeholder">Aucun événement ne correspond.</div>';
+    let cur = '';
+    for (const e of list) {
+      const month = `${MONTHS[parseYmd(e.date).getMonth()]} ${parseYmd(e.date).getFullYear()}`;
+      if (month !== cur) { if (cur) html += '</div>'; html += `<p class="group-date">${month}</p><div class="list pad">`; cur = month; }
+      html += evRow(e, true, true);
+    }
+    if (cur) html += '</div>';
+    html += '<p class="hint pad-hint">La recherche et les filtres avancés (endroits, interventions, périodes) arrivent en phase 5.</p>';
+    view().innerHTML = html;
+    const inp = $('#jq');
+    inp.addEventListener('input', () => { S.jQuery = inp.value; const pos = inp.selectionStart; renderJournal(); const n = $('#jq'); n.focus(); n.setSelectionRange(pos, pos); });
+  }
+
+  function renderPlaceholder() {
+    const txt = S.view === 'evolution'
+      ? 'Les statistiques (journées par couleur, comparaisons hebdomadaires et mensuelles, temps moyen de retour au calme) arrivent en phase 5.'
+      : 'La création du rapport PDF pour les professionnels arrive en phase 5. Il sera produit dans le téléphone et rien ne sera envoyé automatiquement.';
+    view().innerHTML = `<div class="placeholder">${txt}</div>`;
+  }
+
+  // ---------- Paramètres ----------
+  function renderSettings() {
+    const trash = [...S.events.values()].filter((e) => e.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+    const last = S.settings.lastExport ? fmtStamp(S.settings.lastExport) : 'jamais';
+    view().innerHTML = `
+      <section class="card"><h3 class="card-title">Qui utilise ce téléphone ?</h3>
+        <div class="seg">${['Papa', 'Maman'].map((p) => `<button type="button" data-act="parent" data-p="${p}" aria-pressed="${S.settings.parent === p}">${p}</button>`).join('')}</div>
+        <p class="hint">Indiqué sur chaque observation. En phase 3, chaque parent aura son propre compte sécurisé.</p></section>
+      <section class="card"><h3 class="card-title">Prénom de l'enfant</h3>
+        <div class="row"><label class="sr" for="childName">Prénom</label><input class="input" id="childName" maxlength="40" autocomplete="off" value="${esc(childName())}" placeholder="Prénom (facultatif)"><button type="button" class="btn small" data-act="saveChild">Enregistrer</button></div>
+        <p class="hint">Affiché seulement quand l'application est déverrouillée. Enregistré chiffré dans ce téléphone, jamais dans le code public. L'écran de verrouillage et l'icône affichent « ${NEUTRAL_TITLE} ».</p></section>
+      <section class="card"><h3 class="card-title">Sécurité de ce téléphone</h3>
+        <div class="set-row"><span>Verrouillage automatique</span><span class="muted">après 5 min</span></div>
+        <button type="button" class="btn quiet block" data-act="lockNow">${ico('lock', 18)}Verrouiller maintenant</button>
+        <button type="button" class="btn quiet block" data-act="changePin">Changer le code</button>
+        <p class="hint">Les observations sont chiffrées dans ce téléphone. Le code empêche l'ouverture de l'app par une autre personne ; la protection principale reste le verrouillage d'écran de votre téléphone (voir « Confidentialité »).</p></section>
+      <section class="card"><h3 class="card-title">Sauvegarde</h3>
+        <p class="hint">Dernière sauvegarde : ${last}. Gardez le fichier dans un endroit privé.</p>
+        <button type="button" class="btn block" data-act="export" data-mode="enc">Sauvegarder (fichier protégé par mot de passe)</button>
+        <button type="button" class="btn quiet block" data-act="export" data-mode="plain">Exporter en clair (lisible, non protégé)</button>
+        <label class="btn quiet block" for="importFile">Restaurer une sauvegarde</label>
+        <input type="file" id="importFile" accept=".json,application/json" class="sr">
+        <p class="hint">La restauration ajoute les observations manquantes et garde la version la plus récente de chacune ; rien n'est effacé.</p></section>
+      <section class="card"><h3 class="card-title">Corbeille (${trash.length})</h3>
+        ${trash.length ? `<div class="list">${trash.map((e) => `<div class="ev"><span class="bar ${e.intensity ? 'c-' + e.intensity : ''}"></span><span class="body"><span class="meta"><span class="kind">${esc(evTitle(e))}</span><span>${fmtShort(e.date)}</span></span><span class="txt">${esc(evText(e))}</span>
+          <span class="row"><button type="button" class="btn small quiet" data-act="restore" data-id="${e.id}">Restaurer</button><button type="button" class="btn small danger-ghost" data-act="purge" data-id="${e.id}">Effacer</button></span></span></div>`).join('')}</div>` : '<p class="empty-note">La corbeille est vide.</p>'}
+        <p class="hint">Les éléments sont effacés définitivement après 30 jours.</p></section>
+      <section class="card"><h3 class="card-title">Essais</h3>
+        <button type="button" class="btn quiet block" data-act="demo">Ajouter des données fictives</button>
+        <p class="hint">Pour tester l'application. Ces exemples sont inventés et marqués « [Exemple] ».</p>
+        <button type="button" class="btn danger-ghost block" data-act="wipe">Effacer toutes les données de ce téléphone</button></section>
+      <section class="card"><h3 class="card-title">Confidentialité</h3>
+        <p class="hint">Phase 2 : tout reste dans ce téléphone, rien n'est envoyé sur Internet. Les observations sont chiffrées (AES-256) avec une clé que l'application peut utiliser mais pas lire. Limite : quelqu'un qui aurait votre téléphone déverrouillé et des outils techniques avancés pourrait contourner le code de l'app ; d'où l'importance du verrouillage d'écran Android. Aucun diagnostic n'est établi par cette application.</p>
+        <p class="hint">Version ${APP_VERSION}</p></section>`;
+    $('#importFile').addEventListener('change', importFile);
+  }
+
+  // ---------- Sauvegarde / restauration ----------
+  function download(name, text) {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+  function snapshot() { return { events: [...S.events.values()], days: [...S.days.values()] }; }
+  async function doExport(mode) {
+    const stamp = today();
+    let file;
+    if (mode === 'enc') {
+      const pw = await ask({ title: 'Protéger la sauvegarde', text: 'Choisissez un mot de passe d\'au moins 10 caractères. <strong>Sans lui, le fichier ne pourra pas être restauré.</strong> Notez-le dans un endroit sûr.', ok: 'Créer la sauvegarde', input: { label: 'Mot de passe', type: 'password', confirm: 'Confirmer le mot de passe', validate: (a, b) => (a.length < 10 ? 'Au moins 10 caractères.' : a !== b ? 'Les deux mots de passe sont différents.' : null) } });
+      if (!pw) return;
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await passwordKey(pw, salt, EXPORT_ITER);
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(snapshot())));
+      file = { format: 'journal-familial-sauvegarde', version: 1, createdAt: nowIso(), encrypted: true, kdf: { name: 'PBKDF2-SHA256', iterations: EXPORT_ITER, salt: b64(salt) }, iv: b64(iv), data: b64(ct) };
+    } else {
+      const ok = await ask({ title: 'Exporter en clair ?', text: 'Le fichier sera lisible par toute personne qui y a accès. Utilisez plutôt la sauvegarde protégée, sauf pour consulter vos données dans un autre logiciel.', ok: 'Exporter quand même' });
+      if (!ok) return;
+      file = { format: 'journal-familial-sauvegarde', version: 1, createdAt: nowIso(), encrypted: false, data: snapshot() };
+    }
+    download(`journal-familial-${stamp}${mode === 'enc' ? '-protege' : '-lisible'}.json`, JSON.stringify(file, null, mode === 'enc' ? 0 : 2));
+    S.settings.lastExport = nowIso();
+    await saveSettings();
+    render();
+    toast('Sauvegarde créée (dossier Téléchargements)');
+  }
+  function validEvent(e) { return e && typeof e.id === 'string' && e.kind === 'event' && /^\d{4}-\d{2}-\d{2}$/.test(e.date || '') && (!e.intensity || COLORS.includes(e.intensity)) && (!e.type || TYPES[e.type]); }
+  function validDay(d) { return d && typeof d.id === 'string' && d.kind === 'day' && /^\d{4}-\d{2}-\d{2}$/.test(d.date || '') && (!d.rating || COLORS.includes(d.rating)); }
+  async function importFile(ev) {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    if (f.size > 20 * 1024 * 1024) { toast('Fichier trop volumineux.'); return; }
+    let file;
+    try { file = JSON.parse(await f.text()); } catch (e) { toast('Ce fichier n\'est pas une sauvegarde valide.'); return; }
+    if (!file || file.format !== 'journal-familial-sauvegarde') { toast('Ce fichier n\'est pas une sauvegarde de ce journal.'); return; }
+    let data = file.data;
+    if (file.encrypted) {
+      const pw = await ask({ title: 'Mot de passe de la sauvegarde', ok: 'Restaurer', input: { label: 'Mot de passe', type: 'password' } });
+      if (!pw) return;
+      try {
+        const key = await passwordKey(pw, unb64(file.kdf.salt), file.kdf.iterations);
+        data = JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(file.iv) }, key, unb64(file.data))));
+      } catch (e) { toast('Mot de passe incorrect ou fichier endommagé.'); return; }
+    }
+    const evs = (data.events || []).filter(validEvent);
+    const days = (data.days || []).filter(validDay);
+    const toWrite = [];
+    let added = 0, updated = 0;
+    for (const e of evs) {
+      const cur = S.events.get(e.id);
+      if (!cur) { added++; S.events.set(e.id, e); toWrite.push(e); }
+      else if ((e.updatedAt || '') > (cur.updatedAt || '')) { updated++; S.events.set(e.id, e); toWrite.push(e); }
+    }
+    for (const d of days) {
+      const cur = S.days.get(d.date);
+      if (!cur || (d.updatedAt || '') > (cur.updatedAt || '')) { if (cur) d.id = cur.id; S.days.set(d.date, d); toWrite.push(d); if (cur) updated++; else added++; }
+    }
+    const sealed = [];
+    for (const o of toWrite) sealed.push(await seal(o));
+    await recPut(sealed);
+    render();
+    await ask({ title: 'Restauration terminée', text: `${added} élément(s) ajouté(s), ${updated} mis à jour. Rien n'a été effacé.`, ok: 'OK', cancel: null });
+  }
+
+  // ---------- Données fictives ----------
+  async function addDemo() {
+    const base = new Date(); const out = [];
+    const mk = (daysAgo, time, type, intensity, note, extra = {}) => {
+      const d = new Date(base); d.setDate(d.getDate() - daysAgo);
+      if (d.getFullYear() < MIN_YEAR) return;
+      out.push({ id: uid(), kind: 'event', date: ymd(d), time, type, intensity, note: '[Exemple] ' + note, author: daysAgo % 2 ? 'Papa' : 'Maman', createdAt: nowIso(), comments: [], ...extra });
+    };
+    mk(0, '16:05', 'crise', 'orange', 'Refus de quitter le parc, cris environ 10 minutes.', { place: 'Parc', duration: '10', intervention: 'Laisser de l\'espace, puis accompagner' });
+    mk(0, '18:30', 'reussite', null, 'A dit « je suis fâché » au lieu de lancer son jouet.');
+    mk(1, '07:40', 'difficulte', 'jaune', 'Difficulté à s\'habiller, réglé avec le tableau de routine.', { description: 'Refus de mettre son manteau, 3 minutes.', place: 'Maison' });
+    mk(2, '17:10', 'crise', 'rouge', 'Fin de l\'écran avant le souper.');
+    mk(3, '15:30', 'beau_moment', null, 'A partagé ses blocs avec son cousin.');
+    mk(4, '19:20', 'difficulte', null, 'Pleurs au coucher (intensité à préciser).');
+    const daysOut = [];
+    const setDay = (daysAgo, rating, belle = false) => { const d = new Date(base); d.setDate(d.getDate() - daysAgo); if (d.getFullYear() < MIN_YEAR) return; const day = getDay(ymd(d)); day.rating = rating; day.belle = belle; day.updatedAt = nowIso(); day.version = (day.version || 0) + 1; S.days.set(day.date, day); daysOut.push(day); };
+    setDay(1, 'jaune'); setDay(2, 'rouge'); setDay(3, 'vert', true); setDay(5, 'vert', true); setDay(6, 'jaune');
+    out.forEach((e) => { e.updatedAt = e.createdAt; e.version = 1; S.events.set(e.id, e); });
+    const sealed = [];
+    for (const o of [...out, ...daysOut]) sealed.push(await seal(o));
+    await recPut(sealed);
+    S.view = 'calendar'; S.selected = today(); S.month = null; render(); window.scrollTo(0, 0);
+    toast('Données fictives ajoutées');
+  }
+
+  // ---------- Actions ----------
+  async function handleAct(el, ev) {
+    const act = el.dataset.act;
+    switch (act) {
+      case 'nav': closeSheets(); S.view = el.dataset.view; render(); view().focus(); window.scrollTo(0, 0); break;
+      case 'quick': openQuick(el.dataset.date); break;
+      case 'closeSheet': if (ev && el.classList.contains('overlay') && ev.target !== el) return; closeSheets(); break;
+      case 'dictate': { const n = $('#qNote'); n.focus(); n.setSelectionRange(n.value.length, n.value.length); break; }
+      case 'month': {
+        let { y, m } = S.month; m += Number(el.dataset.d);
+        if (m < 0) { m = 11; y--; } if (m > 11) { m = 0; y++; }
+        if (y < MIN_YEAR) return;
+        S.month = { y, m }; render(); break;
+      }
+      case 'today': S.selected = today(); S.month = null; render(); break;
+      case 'pick': S.selected = el.dataset.date; render(); break;
+      case 'rate': {
+        const day = getDay(S.selected); const c = el.dataset.c || null;
+        day.rating = c; if (c !== 'vert') day.belle = false;
+        await saveDay(day); render(); break;
+      }
+      case 'belle': {
+        const day = getDay(S.selected); const prev = { rating: day.rating, belle: day.belle };
+        if (day.belle) { day.belle = false; await saveDay(day); render(); toast('« Belle journée » retirée'); break; }
+        day.rating = 'vert'; day.belle = true; await saveDay(day); render();
+        toast('Belle journée enregistrée', { label: 'Annuler', run: async () => { const d2 = getDay(S.selected); Object.assign(d2, prev); await saveDay(d2); render(); } });
+        break;
+      }
+      case 'open': openDetail(el.dataset.id); break;
+      case 'jf': S.jFilter = el.dataset.f; render(); break;
+      case 'parent': S.settings.parent = el.dataset.p; await saveSettings(); render(); break;
+      case 'saveChild': S.settings.childName = $('#childName').value.trim().slice(0, 40); await saveSettings(); render(); toast('Prénom enregistré'); break;
+      case 'lockNow': lock(); break;
+      case 'changePin': await changePin(); break;
+      case 'export': await doExport(el.dataset.mode); break;
+      case 'restore': { const e = S.events.get(el.dataset.id); delete e.deletedAt; await saveEvent(e); render(); toast('Événement restauré'); break; }
+      case 'purge': {
+        if (!(await ask({ title: 'Effacer définitivement ?', text: 'Cette action est irréversible.', ok: 'Effacer', danger: true }))) return;
+        S.events.delete(el.dataset.id); await recDelete([el.dataset.id]); render(); break;
+      }
+      case 'demo': await addDemo(); break;
+      case 'wipe': {
+        const v = await ask({ title: 'Effacer toutes les données ?', text: 'Toutes les observations, le code et la clé de chiffrement de <strong>ce téléphone</strong> seront supprimés. Faites d\'abord une sauvegarde si nécessaire.', ok: 'Effacer', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+        if (!v) return;
+        await wipeAll(); location.reload(); break;
+      }
+      default: break;
+    }
+  }
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-act]');
+    if (!el || el.closest('.sheet') || el.closest('.panel')) return; // gérés par leur propre écouteur
+    handleAct(el, ev);
+  });
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && $('#sheet-root').innerHTML) closeSheets(); });
+
+  // ---------- Verrouillage ----------
+  let lastActivity = Date.now();
+  let hiddenAt = null;
+  const LOCK_MS = 5 * 60 * 1000;
+  ['pointerdown', 'keydown', 'input', 'scroll', 'touchstart'].forEach((t) => document.addEventListener(t, () => { lastActivity = Date.now(); }, { passive: true, capture: true }));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (S.unlocked && hiddenAt && Date.now() - hiddenAt >= LOCK_MS) lock();
+  });
+  setInterval(() => { if (S.unlocked && Date.now() - lastActivity >= LOCK_MS) lock(); }, 10000);
+
+  function lock() {
+    S.unlocked = false;
+    DEK = null;
+    S.events.clear(); S.days.clear(); S.settings = null;
+    closeSheets(); $('#modal-root').innerHTML = ''; $('#toast').hidden = true;
+    view().innerHTML = '';
+    $('#shell').hidden = true;
+    applyTitles(false);
+    showLock();
+  }
+  async function unlockWith() {
+    DEK = await loadDek();
+    await loadAll();
+    S.unlocked = true; lastActivity = Date.now();
+    $('#lock').hidden = true; $('#lock').innerHTML = '';
+    $('#shell').hidden = false;
+    S.view = 'calendar'; S.selected = today(); S.month = null;
+    render();
+    if (!S.settings.parent) askParent(); else if (S.settings.childName === undefined) askChild();
+  }
+  async function askParent() {
+    const root = $('#modal-root');
+    root.innerHTML = `<div class="modal-wrap" role="dialog" aria-modal="true"><div class="modal"><h2>Qui utilise ce téléphone ?</h2><p>Votre nom sera indiqué sur les observations que vous notez.</p>
+      <div class="actions"><button type="button" class="btn" data-p="Papa">Papa</button><button type="button" class="btn" data-p="Maman">Maman</button></div></div></div>`;
+    $$('[data-p]', root).forEach((b) => { b.onclick = async () => { S.settings.parent = b.dataset.p; await saveSettings(); root.innerHTML = ''; render(); if (S.settings.childName === undefined) askChild(); }; });
+  }
+  async function askChild() {
+    const v = await ask({ title: 'Prénom de l\'enfant', text: 'Il sera affiché dans l\'application une fois déverrouillée. Il est enregistré chiffré dans ce téléphone et n\'apparaît jamais dans le code public. Vous pouvez le laisser vide.', ok: 'Enregistrer', cancel: 'Plus tard', input: { label: 'Prénom', validate: (x) => (x.trim().length > 40 ? '40 caractères au maximum.' : null) } });
+    S.settings.childName = v === null ? '' : v.trim();
+    await saveSettings(); render();
+  }
+
+  // Écran du code
+  function pinPad({ title, msg, onDone, footer = '' }) {
+    let val = '';
+    const el = $('#lock');
+    el.hidden = false;
+    el.innerHTML = `<span class="logo">${ico('book', 36)}</span><h1>${NEUTRAL_TITLE}</h1>
+      <p class="msg" id="pinMsg">${esc(msg)}</p>
+      <div class="dots" aria-hidden="true">${'<span></span>'.repeat(4)}</div>
+      <p class="sr" aria-live="polite" id="pinCount"></p>
+      <div class="keys">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((k) => `<button type="button" class="key" data-k="${k}">${k}</button>`).join('')}<span class="key blank"></span><button type="button" class="key" data-k="0">0</button><button type="button" class="key back" data-k="del" aria-label="Effacer le dernier chiffre">${ico('back', 24)}</button></div>
+      ${footer}`;
+    el.setAttribute('aria-label', title);
+    const paint = () => { const c = $('#pinCount'); if (!c) return; $$('.dots span', el).forEach((s, i) => s.classList.toggle('on', i < val.length)); c.textContent = `${val.length} chiffre(s) sur 4`; };
+    const press = async (k) => {
+      if (el.dataset.busy) return;
+      if (k === 'del') val = val.slice(0, -1);
+      else if (val.length < 4) val += k;
+      paint();
+      if (val.length === 4) { el.dataset.busy = '1'; const v = val; val = ''; try { await onDone(v); } finally { delete el.dataset.busy; paint(); } }
+    };
+    $$('[data-k]', el).forEach((b) => { b.onclick = () => press(b.dataset.k); });
+    el.onkeydown = (e) => { if (/^[0-9]$/.test(e.key)) press(e.key); else if (e.key === 'Backspace') press('del'); };
+    paint();
+    setTimeout(() => $('[data-k="1"]', el).focus(), 30);
+  }
+  const setMsg = (t, err = false) => { const m = $('#pinMsg'); if (m) { m.textContent = t; m.classList.toggle('err', err); } };
+
+  async function showLock() {
+    const lockMeta = await metaGet('lock');
+    if (!lockMeta) return setupPin();
+    pinPad({
+      title: 'Déverrouillage', msg: 'Entrez votre code',
+      footer: '<button type="button" class="linkish" id="forgot">Code oublié ?</button>',
+      onDone: async (pin) => {
+        const m = await metaGet('lock');
+        const now = Date.now();
+        if (m.until && now < m.until) { setMsg(`Trop d'essais. Réessayez dans ${Math.ceil((m.until - now) / 1000)} s.`, true); return; }
+        const h = await pinHash(pin, m.salt, m.iter);
+        if (sameBytes(h, m.hash)) { m.fails = 0; m.until = 0; await metaSet('lock', m); await unlockWith(); return; }
+        m.fails = (m.fails || 0) + 1;
+        if (m.fails >= 5) m.until = now + Math.min(15 * 60, 30 * 2 ** (m.fails - 5)) * 1000;
+        await metaSet('lock', m);
+        setMsg(m.fails >= 5 ? `Code incorrect. Attendez ${Math.round((m.until - now) / 1000)} s.` : 'Code incorrect.', true);
+      },
+    });
+    $('#forgot').onclick = async () => {
+      const v = await ask({ title: 'Code oublié', text: 'Pour l\'instant (phase 2), le seul moyen est d\'effacer les données de ce téléphone puis de restaurer une sauvegarde. Dès la phase 3, vous pourrez simplement vous reconnecter avec votre mot de passe et retrouver toutes les observations synchronisées.', ok: 'Effacer ce téléphone', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+      if (v) { await wipeAll(); location.reload(); }
+    };
+  }
+  function setupPin(onSaved) {
+    let first = null;
+    pinPad({
+      title: 'Choix du code', msg: 'Choisissez un code à 4 chiffres',
+      onDone: async (pin) => {
+        if (!first) {
+          if (/^(\d)\1{3}$/.test(pin) || ['1234', '4321', '0123', '9876'].includes(pin)) { setMsg('Code trop facile à deviner. Choisissez-en un autre.', true); return; }
+          first = pin; setMsg('Entrez le même code une seconde fois'); return;
+        }
+        if (pin !== first) { first = null; setMsg('Les codes ne correspondent pas. Recommencez.', true); return; }
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        await metaSet('lock', { salt, hash: await pinHash(pin, salt, PIN_ITER), iter: PIN_ITER, fails: 0, until: 0, createdAt: nowIso() });
+        if (onSaved) onSaved(); else await unlockWith();
+      },
+    });
+  }
+  async function changePin() {
+    const ok = await ask({ title: 'Changer le code', text: 'Vous allez choisir un nouveau code à 4 chiffres.', ok: 'Continuer' });
+    if (!ok) return;
+    $('#shell').hidden = true;
+    setupPin(() => { $('#lock').hidden = true; $('#lock').innerHTML = ''; $('#shell').hidden = false; render(); toast('Nouveau code enregistré'); });
+  }
+
+  // ---------- Démarrage ----------
+  async function start() {
+    if (!window.crypto || !crypto.subtle || !window.indexedDB) {
+      document.body.innerHTML = '<p>Ce navigateur ne permet pas de protéger les données. Utilisez Chrome à jour.</p>';
+      return;
+    }
+    try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) { /* facultatif */ }
+    if ('serviceWorker' in navigator && location.protocol === 'https:' && !window.__JM_PREVIEW__) {
+      try { await navigator.serviceWorker.register('sw.js'); } catch (e) { /* hors ligne indisponible */ }
+    }
+    await showLock();
+  }
+  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') window.__JM_TEST__ = { lock, expireLock: () => { lastActivity = 0; } };
+  start();
+})();

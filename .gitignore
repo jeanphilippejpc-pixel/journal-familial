@@ -1,0 +1,10 @@
+# Ne jamais publier de sauvegardes ni de données réelles
+*.json.bak
+journal-familial-*.json
+journal-*.json
+sauvegardes/
+*.env
+.env*
+node_modules/
+tests/output/
+__pycache__/
