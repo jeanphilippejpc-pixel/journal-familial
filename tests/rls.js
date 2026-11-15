@@ -108,6 +108,35 @@
       const invalid = await call('POST', '/rest/v1/events', { token, body: { id: uuid(), date: '2020-01-01', type: 'autre', note: '[TEST RLS] date invalide' } });
       t.add('Fiche invalide (date avant 2026) : refusée par le serveur', denied(invalid), show(invalid));
 
+      // Phase 4 (script 04) : approbation contrôlée par le serveur, texte original verrouillé
+      const sid = uuid();
+      const sNewApproved = await call('POST', '/rest/v1/events', { token, body: { id: uuid(), date: TEST_DATE, type: 'autre', note: '[TEST RLS] nouvelle déjà approuvée', approval_version: 0 } });
+      t.add('Phase 4 : nouvelle fiche envoyée déjà approuvée → refusée (enregistrer d\'abord)', denied(sNewApproved), show(sNewApproved));
+      const sIns = await call('POST', '/rest/v1/events', { token, body: { id: sid, date: TEST_DATE, type: 'autre', note: '[TEST RLS] structurée', original_text: '[TEST RLS] texte original', context: '[TEST RLS] contexte', categories: ['emotions'], approved_at: '2020-01-01T00:00:00Z', approved_by: other } });
+      const sr = sIns.ok ? sIns.data[0] : null;
+      t.add('Phase 4 : nouvelle fiche enregistrée non approuvée (approved_at / approved_by envoyés ignorés)', sr && sr.approved_at === null && sr.approved_by === null, show(sIns));
+      const sAppr = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: sr ? sr.version : 1 } });
+      const sa = sAppr.ok ? sAppr.data[0] : null;
+      t.add('Phase 4 : approbation séparée → date fixée par le serveur, au nom du parent connecté, version +1', sa && sa.approved_by === me && Date.parse(sa.approved_at) > Date.parse('2026-01-01') && sa.version === sr.version + 1, sa ? `approuvée par ${sa.approved_by}, version ${sa.version}` : show(sAppr));
+      const sMix = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { note: '[TEST RLS] modifiée en approuvant', approval_version: sa ? sa.version : 2 } });
+      t.add('Phase 4 : approbation + modification dans la même requête → refusée', denied(sMix), show(sMix));
+      await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { note: '[TEST RLS] version B' } }); // modification B enregistrée
+      const sB = await call('GET', `/rest/v1/events?id=eq.${sid}&select=version`, { token });
+      const vB = sB.ok ? sB.data[0].version : null;
+      const sApprB = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: vB } });
+      t.add('Phase 4 : version B approuvée séparément', sApprB.ok && sApprB.data[0].approved_by === me, show(sApprB));
+      const sLate = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: sr ? sr.version : 1 } });
+      const sNow = await call('GET', `/rest/v1/events?id=eq.${sid}&select=note,version`, { token });
+      t.add('Phase 4 : ancienne demande arrivée en retard → refusée, la version récente reste intacte', denied(sLate) && sNow.ok && sNow.data[0].note === '[TEST RLS] version B' && sNow.data[0].version === vB + 1, show(sLate));
+      const sOrig = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { original_text: '[TEST RLS] retouché' } });
+      t.add('Phase 4 : texte original impossible à modifier', denied(sOrig), show(sOrig));
+      const sEdit = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { context: '[TEST RLS] contexte modifié', approved_by: other } });
+      const se = sEdit.ok ? sEdit.data[0] : null;
+      t.add('Phase 4 : section modifiée sans nouvelle approbation → approbation retirée', se && se.approved_at === null && se.approved_by === null, se ? `approved_at = ${se.approved_at}` : show(sEdit));
+      const sCat = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { categories: ['piratage'] } });
+      t.add('Phase 4 : catégorie inconnue refusée', denied(sCat), show(sCat));
+      await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { deleted_at: new Date().toISOString() } }); // à la corbeille (nettoyée par le script 03)
+
       // Commentaires : ajoutés, jamais modifiés ni effacés
       const cid = uuid();
       const c = await call('POST', '/rest/v1/comments', { token, body: { id: cid, event_id: id, text: '[TEST RLS] commentaire fictif', author_id: other } });

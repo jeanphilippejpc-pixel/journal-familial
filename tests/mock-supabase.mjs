@@ -2,7 +2,9 @@
 // et les déclencheurs de version de la vraie base. Données fictives uniquement.
 import { randomUUID } from 'node:crypto';
 
-export function createMock({ now = () => Date.now() } = {}) {
+export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
+  const opt = { schema }; // 3 = base avant le script 04 (pour tester l'ordre migration → publication)
+  const NEW_COLS = ['outcome', 'impressions', 'original_text', 'categories', 'approval_version', 'approved_at', 'approved_by'];
   const users = {
     'papa@test.local': { id: '11111111-1111-4111-8111-111111111111', password: 'motdepasse-test', name: 'Papa', parent: true },
     'maman@test.local': { id: '22222222-2222-4222-8222-222222222222', password: 'motdepasse-test', name: 'Maman', parent: true },
@@ -45,17 +47,25 @@ export function createMock({ now = () => Date.now() } = {}) {
     });
   }
   const KEY = { events: 'id', days: 'date', comments: 'id' };
-  const ALLOWED = { events: ['id', 'date', 'time', 'type', 'intensity', 'note', 'duration_min', 'place', 'people', 'state_before', 'context', 'description', 'adult_reaction', 'intervention', 'child_reaction', 'calm_time_min', 'helped', 'extra', 'marked_complete', 'deleted_at', 'author_id', 'version', 'created_at', 'updated_at', 'updated_by'], days: ['date', 'rating', 'belle', 'version', 'created_at', 'updated_at', 'updated_by'], comments: ['id', 'event_id', 'text', 'author_id', 'created_at'] };
+  const ALLOWED = { events: ['id', 'date', 'time', 'type', 'intensity', 'note', 'duration_min', 'place', 'people', 'state_before', 'context', 'description', 'adult_reaction', 'intervention', 'child_reaction', 'calm_time_min', 'helped', 'extra', 'marked_complete', 'deleted_at', 'author_id', 'version', 'created_at', 'updated_at', 'updated_by', 'outcome', 'impressions', 'original_text', 'categories', 'approval_version', 'approved_at', 'approved_by'], days: ['date', 'rating', 'belle', 'version', 'created_at', 'updated_at', 'updated_by'], comments: ['id', 'event_id', 'text', 'author_id', 'created_at'] };
   function check(table, r) {
     if (table === 'events') {
       if (!r.type && !r.intensity && !(r.note && r.note !== '')) return 'check';
       if (r.date < '2026-01-01') return 'check';
       if (r.type && !['difficulte', 'crise', 'reussite', 'beau_moment', 'autre'].includes(r.type)) return 'check';
+      if (!Array.isArray(r.categories) || r.categories.length > 8 || r.categories.some((c) => !CATS.includes(c))) return 'check';
+      for (const k of ['outcome', 'impressions']) if (r[k] && r[k].length > 5000) return 'check';
+      if (r.original_text && r.original_text.length > 10000) return 'check';
     }
     if (table === 'days' && r.rating && !['vert', 'jaune', 'orange', 'rouge'].includes(r.rating)) return 'check';
     if (table === 'comments' && !(r.text && r.text.length)) return 'check';
     return null;
   }
+  const CATS = ['emotions', 'comportements', 'social', 'autonomie', 'communication', 'sommeil', 'apprentissages', 'reussites'];
+  // Contenu dont la modification retire l'approbation (comme private.stamp_approval, script 04 v2)
+  const CONTENT = ['date', 'time', 'type', 'intensity', 'note', 'duration_min', 'place', 'people', 'state_before', 'context', 'description', 'adult_reaction', 'intervention', 'child_reaction', 'calm_time_min', 'helped', 'extra', 'outcome', 'impressions', 'original_text', 'categories'];
+  const blank = (v) => v != null && String(v).trim() === '';
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   const json = (status, body) => ({ status, body });
   const err = (status, code, message) => json(status, { code, message });
 
@@ -95,6 +105,8 @@ export function createMock({ now = () => Date.now() } = {}) {
       return json(200, parent ? parents.map((p) => ({ ...p })) : []);
     }
     if (!T[table]) return err(404, 'PGRST205', 'table not found');
+    if (table === 'events' && opt.schema < 4 && body && (method === 'POST' || method === 'PATCH')) { const k = NEW_COLS.find((c) => body[c] !== undefined); if (k) return err(400, 'PGRST204', `Could not find the '${k}' column of 'events' in the schema cache`); }
+    const strip = (r) => { if (table !== 'events' || opt.schema >= 4) return { ...r }; const c = { ...r }; NEW_COLS.forEach((k) => delete c[k]); return c; };
     const filters = parseFilters(u.searchParams);
     const rows = () => [...T[table].values()].filter((r) => parent && match(r, filters));
     if (method === 'GET') {
@@ -105,7 +117,7 @@ export function createMock({ now = () => Date.now() } = {}) {
         out.sort((a, b) => { for (const [c, d] of keys) { const x = String(a[c]); const y = String(b[c]); if (x !== y) return (x < y ? -1 : 1) * (d === 'desc' ? -1 : 1); } return 0; });
       }
       const off = Number(u.searchParams.get('offset') || 0); const lim = Number(u.searchParams.get('limit') || 1e9);
-      return json(200, out.slice(off, off + lim).map((r) => ({ ...r })));
+      return json(200, out.slice(off, off + lim).map(strip));
     }
     if (method === 'POST') {
       if (!parent) return err(403, '42501', `new row violates row-level security policy for table "${table}"`);
@@ -118,11 +130,11 @@ export function createMock({ now = () => Date.now() } = {}) {
       r.created_at = t;
       if (table !== 'comments') { r.version = 1; r.updated_at = t; r.updated_by = uid; }
       if (table !== 'days') r.author_id = uid;
-      if (table === 'events') { r.marked_complete = !!r.marked_complete; if (r.deleted_at) r.deleted_at = t; }
+      if (table === 'events') { r.marked_complete = !!r.marked_complete; if (r.deleted_at) r.deleted_at = t; if (r.categories == null) r.categories = []; if (blank(r.original_text)) r.original_text = null; if (r.approval_version != null) return err(400, 'P0001', 'Approbation refusée : une nouvelle fiche doit d\'abord être enregistrée, puis approuvée séparément.'); r.approved_at = null; r.approved_by = null; }
       if (table === 'days') r.belle = !!r.belle;
       if (check(table, r)) return err(400, '23514', 'new row violates check constraint');
       T[table].set(key, r);
-      return json(201, [{ ...r }]);
+      return json(201, [strip(r)]);
     }
     if (method === 'PATCH') {
       if (table === 'comments') return err(403, '42501', 'permission denied for table comments');
@@ -134,13 +146,23 @@ export function createMock({ now = () => Date.now() } = {}) {
         if (table === 'events') {
           n.author_id = old.author_id; n.id = old.id;
           if (n.deleted_at == null) n.deleted_at = null; else if (old.deleted_at == null) n.deleted_at = n.updated_at; else n.deleted_at = old.deleted_at;
+          // imite private.stamp_approval (script 04)
+          if (blank(n.original_text) && old.original_text == null) n.original_text = null;
+          if (old.original_text != null && !same(n.original_text, old.original_text)) return err(400, 'P0001', 'Le texte original ne peut pas être modifié ni effacé.');
+          // v5 : approbation = requête seule, approval_version égale à la version ACTUELLE, sans modification du contenu
+          const contenuModifie = CONTENT.some((k) => !same(n[k], old[k]));
+          const demande = n.approval_version != null && !same(n.approval_version, old.approval_version);
+          if (demande && n.approval_version !== old.version) return err(400, 'P0001', `Approbation refusée : elle porte sur une ancienne version de la fiche (version ${n.approval_version}, version actuelle ${old.version}).`);
+          if (demande && contenuModifie) return err(400, 'P0001', 'Approbation refusée : une approbation ne peut pas modifier la fiche.');
+          if (demande) { n.approved_at = n.updated_at; n.approved_by = uid; n.approval_version = old.version; }
+          else { n.approval_version = old.approval_version; n.approved_at = old.approved_at; n.approved_by = old.approved_by; if (contenuModifie) { n.approved_at = null; n.approved_by = null; } }
         }
         if (table === 'days') n.date = old.date;
         if (check(table, n)) return err(400, '23514', 'violates check constraint');
         out.push(n);
       }
       out.forEach((n) => T[table].set(n[KEY[table]], n));
-      return json(200, out.map((r) => ({ ...r })));
+      return json(200, out.map(strip));
     }
     if (method === 'DELETE') {
       if (table !== 'events') return err(403, '42501', `permission denied for table ${table}`);
@@ -162,5 +184,5 @@ export function createMock({ now = () => Date.now() } = {}) {
     const text = r.body == null ? '' : JSON.stringify(r.body);
     return { ok: r.status >= 200 && r.status < 300, status: r.status, text: async () => text };
   }
-  return { handle, fetchFn, net, tables: T, users, stats, expireTokens: () => { for (const t of tokens.values()) t.exp = 0; } };
+  return { handle, fetchFn, net, opt, tables: T, users, stats, expireTokens: () => { for (const t of tokens.values()) t.exp = 0; } };
 }

@@ -213,3 +213,16 @@ textarea.input { resize: vertical; line-height: 1.45; }
 .cmp th, .cmp td { text-align: left; vertical-align: top; padding: 8px 6px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .cmp thead th { color: var(--muted); font-weight: 700; font-size: 12px; }
 .cmp tbody th { color: var(--muted); font-weight: 600; width: 30%; }
+
+/* ---------- Phase 4 : observation structurée ---------- */
+.original { white-space: pre-wrap; background: var(--bg); border-radius: 12px; padding: 10px 12px; margin: 8px 0 0; font-size: 15px; }
+details > summary { cursor: pointer; padding: 4px 0; }
+.sent { border-top: 1px solid var(--line); padding: 10px 0 4px; }
+.sent:first-child { border-top: 0; padding-top: 0; }
+.sent p { margin: 0 0 6px; }
+.sent select.input { min-height: 40px; padding: 6px 10px; }
+.steps { margin: 6px 0 8px; padding-left: 20px; font-size: 14px; color: var(--muted); }
+.steps li { margin: 0 0 6px; }
+.chip-tag.soft { background: var(--bg); color: var(--muted); font-weight: 600; }
+.ev .tags { gap: 4px; margin-top: 4px; }
+.ev .tags .chip-tag { font-size: 11px; padding: 2px 8px; }

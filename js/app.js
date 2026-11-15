@@ -1,14 +1,17 @@
-/* Journal familial — application (phase 3 : comptes et synchronisation)
+/* Journal familial — application (phase 4 : observations structurées)
  * Aucune bibliothèque externe. Les observations sont chiffrées (AES-GCM 256) avant d'être écrites
  * dans le stockage du navigateur, puis envoyées en HTTPS à Supabase pour les deux parents (js/sync.js).
+ * L'organisation des récits se fait dans le téléphone, par des règles explicables (js/organize.js).
  */
 (() => {
   'use strict';
 
   // ---------- Constantes ----------
-  const APP_VERSION = '0.3.0';
+  const APP_VERSION = '0.4.0';
   const CFG = window.JF_CONFIG;
   const JS = window.JFSync;
+  const OR = window.JFOrganize;
+  const STRUCT_FIELDS = ['context', 'description', 'childReaction', 'intervention', 'outcome', 'impressions'];
   const SYNC_EVERY_MS = 60 * 1000;
   const DB_NAME = 'journal-familial';
   const NEUTRAL_TITLE = 'Journal familial';
@@ -28,17 +31,22 @@
   const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
   const DOW = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
   const PLACES = ['Maison', 'École', 'Garderie', 'Voiture', 'Sortie', 'Parc', 'Chez la famille', 'Magasin'];
-  const EDITABLE = ['date', 'time', 'intensity', 'type', 'note', 'markedComplete', 'duration', 'place', 'people', 'stateBefore', 'context', 'description', 'adultReaction', 'intervention', 'childReaction', 'calmTime', 'helped', 'extra'];
+  const EDITABLE = ['date', 'time', 'intensity', 'type', 'note', 'markedComplete', 'duration', 'place', 'people', 'stateBefore', 'context', 'description', 'adultReaction', 'intervention', 'childReaction', 'outcome', 'impressions', 'calmTime', 'helped', 'extra'];
+  // Les 6 sections de l'observation structurée (mêmes champs que la fiche détaillée)
+  const SECTION_LABELS = { context: 'Contexte', description: 'Ce qui s\'est passé', childReaction: 'Réaction {de_enfant}', intervention: 'Intervention du parent', outcome: 'Résultat observé', impressions: 'Impressions du parent' };
+  const SECTION_HINTS = { context: 'Où et quand', description: 'Les faits observés', childReaction: 'Ses paroles, gestes ou comportements', intervention: 'Ce que Papa ou Maman a fait', outcome: 'Comment la situation s\'est terminée', impressions: 'Ce que vous pensez ou supposez (pas un fait observé)' };
   const DETAIL_FIELDS = [
+    ['context', SECTION_LABELS.context, 'area'],
+    ['description', SECTION_LABELS.description, 'area'],
+    ['childReaction', SECTION_LABELS.childReaction, 'area'],
+    ['intervention', SECTION_LABELS.intervention, 'area'],
+    ['outcome', SECTION_LABELS.outcome, 'area'],
+    ['impressions', SECTION_LABELS.impressions, 'area'],
     ['duration', 'Durée approximative (minutes)', 'number'],
     ['place', 'Endroit', 'place'],
     ['people', 'Personnes présentes', 'text'],
     ['stateBefore', 'État apparent {de_enfant} avant', 'text'],
-    ['context', 'Contexte et déclencheur possible', 'area'],
-    ['description', 'Description factuelle', 'area'],
     ['adultReaction', 'Réaction des adultes', 'area'],
-    ['intervention', 'Intervention utilisée', 'area'],
-    ['childReaction', 'Réaction {de_enfant}', 'area'],
     ['calmTime', 'Temps pour retrouver le calme (minutes)', 'number'],
     ['helped', 'Ce qui semble avoir aidé', 'area'],
     ['extra', 'Notes supplémentaires', 'area'],
@@ -149,6 +157,7 @@
     unlocked: false,
     events: new Map(),
     days: new Map(), // date -> jour
+    drafts: new Map(), // brouillons d'observation (chiffrés, jamais envoyés)
     settings: null,
     view: 'calendar',
     month: null, // {y, m}
@@ -162,7 +171,7 @@
   const defaultSettings = () => ({ id: 'settings', kind: 'settings', parent: '', lastExport: null, createdAt: nowIso() });
 
   async function loadAll() {
-    S.events.clear(); S.days.clear();
+    S.events.clear(); S.days.clear(); S.drafts.clear();
     S.settings = null; S.syncState = null;
     const recs = await recAll();
     for (const r of recs) {
@@ -173,6 +182,7 @@
       else if (o.kind === 'day') { const ex = S.days.get(o.date); if (!ex || ex.updatedAt < o.updatedAt) S.days.set(o.date, o); }
       else if (o.kind === 'settings') S.settings = o;
       else if (o.kind === 'sync') S.syncState = o;
+      else if (o.kind === 'draft') S.drafts.set(o.id, o);
     }
     if (!S.settings) { S.settings = defaultSettings(); await saveSettings(); }
     if (!S.syncState) S.syncState = { id: 'sync', kind: 'sync', names: {} };
@@ -314,6 +324,24 @@
   }
   function evText(e) { return e.note || e.description || e.context || ''; }
   const isPositive = (e) => e.type === 'reussite' || e.type === 'beau_moment';
+  // Observation structurée (phase 4) et approbation
+  const isStructured = (e) => JS.usesStructure(e);
+  // « Approuvée » seulement quand le SERVEUR a confirmé l'approbation (jamais sur la seule demande)
+  const isApproved = (e) => !e.approveRequest && !!e.approval && !e.approvalVoid;
+  const isApprovalPending = (e) => !!e.approveRequest;
+  const parentName = (id) => ((S.syncState && S.syncState.names) || {})[id] || '';
+  function approvalLine(e) {
+    if (e.approveRequest) {
+      if (e.conflict) return 'Approbation non enregistrée : la fiche a aussi été modifiée sur l\'autre téléphone. Choisissez la version, relisez, puis approuvez.';
+      if (e.syncError) return `Approbation non enregistrée : ${esc(e.syncError)}`;
+      return 'Approbation demandée · en attente de confirmation du serveur';
+    }
+    if (isApproved(e)) return `Approuvée${parentName(e.approval.byId) || e.approval.by ? ' par ' + esc(parentName(e.approval.byId) || e.approval.by) : ''} le ${fmtStamp(e.approval.at)}`;
+    return 'Non approuvée';
+  }
+  // Contenu approuvé : tout sauf la corbeille et la case « Fiche complète » (même règle que le serveur, script 04)
+  function contentKey(e) { const r = JS.eventToRow({ ...e, hasStructure: true }); delete r.id; delete r.marked_complete; delete r.deleted_at; delete r.approved_at; return JSON.stringify(r); }
+  const catTags = (e) => (e.categories || []).map((c) => `<span class="chip-tag soft">${esc(OR.CATEGORY_LABEL[c] || c)}</span>`).join('');
 
   // ---------- Interface commune ----------
   const view = () => $('#view');
@@ -347,7 +375,16 @@
       };
     });
   }
-  function closeSheets() { $('#sheet-root').innerHTML = ''; }
+  // Fermer un écran ne perd jamais un brouillon : il est écrit (chiffré) et peut être repris
+  function closeSheets() {
+    const d = liveDraft;
+    const kept = d && $('#sheet-root').innerHTML && draftHasContent(d);
+    if (d) flushDraft(); // écrit immédiatement, pendant que la clé est disponible
+    liveDraft = null;
+    $('#sheet-root').innerHTML = '';
+    if (kept) { S.drafts.set(d.id, d); if (S.unlocked) render(); toast('Brouillon gardé', { label: 'Reprendre', run: () => resumeDraft(d.id) }); }
+  }
+  function resumeDraft(id) { const d = S.drafts.get(id); if (!d) { toast('Ce brouillon n\'existe plus.'); return; } if (d.step === 'review') openReview(id); else openQuick(null, d); }
 
   function renderNav() {
     const tabs = [['calendar', 'Calendrier', 'cal'], ['journal', 'Journal', 'book'], null, ['evolution', 'Évolution', 'chart'], ['reports', 'Rapports', 'doc']];
@@ -386,6 +423,10 @@
     else if (S.loggedIn && syncErrors().length) out += `<div class="banner warn"><span class="spacer">Certaines observations n'ont pas pu être envoyées. Elles sont gardées dans ce téléphone.</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Détails</button></div>`;
     return out;
   }
+  function draftBanner() {
+    const list = [...S.drafts.values()].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    return list.map((d) => `<div class="banner"><span class="spacer"><strong>Brouillon non terminé</strong> · ${fmtShort(d.date)}${d.text ? ` · « ${esc(d.text.slice(0, 50))}${d.text.length > 50 ? '…' : ''} »` : ''}<br><span class="small">Gardé chiffré dans ce téléphone, pas encore enregistré dans le journal.</span></span><button type="button" class="btn small quiet" data-act="resumeDraft" data-id="${esc(d.id)}">Reprendre</button></div>`).join('');
+  }
   function renderCalendar() {
     if (!S.month) { const d = parseYmd(S.selected); S.month = { y: d.getFullYear(), m: d.getMonth() }; }
     const { y, m } = S.month;
@@ -412,7 +453,7 @@
     }
     const canPrev = !(y === MIN_YEAR && m === 0);
     const legend = COLORS.map((c) => `<span><i class="sw c-${c}"></i>${COLOR_LABEL[c]}</span>`).join('') + '<span><i class="sw none"></i>Aucune observation</span><span><i class="mark"></i>Réussite</span><span><i class="mark todo"></i>À compléter</span>';
-    view().innerHTML = `${syncBanner()}${backupBanner()}
+    view().innerHTML = `${draftBanner()}${syncBanner()}${backupBanner()}
       <section class="card" aria-label="Calendrier du mois">
         <div class="cal-head">
           <button type="button" class="icon-btn plain" data-act="month" data-d="-1" aria-label="Mois précédent" ${canPrev ? '' : 'disabled'}>${ico('left', 20)}</button>
@@ -454,28 +495,52 @@
       <span class="bar ${e.intensity ? 'c-' + e.intensity : ''}"></span>
       <span class="body"><span class="meta"><span class="kind">${esc(evTitle(e))}</span><span>${showDate ? fmtShort(e.date) + ' · ' : ''}${fmtTime(e.time)}${who}</span></span>
       ${evText(e) ? `<span class="txt">${esc(evText(e))}</span>` : ''}
-      ${isIncomplete(e) ? '<span class="todo-tag">À compléter</span>' : ''}</span></button>`;
+      ${(e.categories || []).length ? `<span class="row wrap tags">${catTags(e)}</span>` : ''}
+      ${isIncomplete(e) ? '<span class="todo-tag">À compléter</span>' : ''}${isApprovalPending(e) ? '<span class="todo-tag">Approbation en attente</span>' : isStructured(e) && !isApproved(e) ? '<span class="todo-tag">Non approuvée</span>' : ''}</span></button>`;
   }
 
   // ---------- Ajout rapide ----------
-  function openQuick(date) {
+  // ---------- Brouillons (chiffrés, jamais envoyés, jamais perdus en silence) ----------
+  let draftTimer = null;
+  let liveDraft = null; // brouillon en cours d'édition (lu par flushDraft avant verrouillage ou fermeture)
+  const draftHasContent = (d) => !!(d && ((d.text || '').trim() || d.intensity || d.type || d.step === 'review'));
+  async function writeDraft(d) {
+    if (!DEK || !d) return;
+    if (!draftHasContent(d) && !d.eventId) { if (S.drafts.has(d.id)) { S.drafts.delete(d.id); await recDelete([d.id]); } return; }
+    d.updatedAt = nowIso();
+    S.drafts.set(d.id, d);
+    await saveRecord(d);
+  }
+  function queueDraft(d) { liveDraft = d; clearTimeout(draftTimer); draftTimer = setTimeout(() => { writeDraft(d).catch(() => toast('Le brouillon n\'a pas pu être enregistré. Gardez l\'écran ouvert et réessayez.')); }, 300); }
+  async function flushDraft() { clearTimeout(draftTimer); if (liveDraft) { try { await writeDraft(liveDraft); } catch (e) { /* rien */ } } }
+  async function dropDraft(id) { clearTimeout(draftTimer); if (liveDraft && liveDraft.id === id) liveDraft = null; S.drafts.delete(id); await recDelete([id]); }
+  const newDraft = (f) => ({ id: 'draft-' + uid(), kind: 'draft', v: 1, step: 'text', createdAt: nowIso(), updatedAt: nowIso(), date: today(), time: nowTime(), intensity: null, type: null, text: '', ...f });
+  // Fermeture de l'onglet, mise en arrière-plan ou mise à jour de l'app : on écrit tout de suite
+  document.addEventListener('visibilitychange', () => { if (document.hidden) flushDraft(); });
+  window.addEventListener('pagehide', () => { flushDraft(); });
+
+  function openQuick(date, resume = null) {
     const d = date || (S.view === 'calendar' ? S.selected : today());
-    const q = { date: d > today() ? today() : d, time: nowTime(), intensity: null, type: null };
+    const q = resume || newDraft({ date: d > today() ? today() : d });
+    liveDraft = q;
     const root = $('#sheet-root');
     root.innerHTML = `<div class="overlay" data-act="closeSheet"><section class="sheet" role="dialog" aria-modal="true" aria-labelledby="qTitle">
       <span class="grab"></span>
-      <div class="sheet-head"><h2 id="qTitle">Nouvel événement</h2><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Fermer">${ico('x', 20)}</button></div>
-      <div class="two"><label class="field"><span class="lbl">Date</span><input class="input" type="date" id="qDate" value="${q.date}" min="${MIN_YEAR}-01-01" max="${today()}"></label>
-      <label class="field"><span class="lbl">Heure</span><input class="input" type="time" id="qTime" value="${q.time}"></label></div>
-      <div class="field"><span class="lbl">1. Intensité</span><div class="swatches">${COLORS.map((c) => `<button type="button" class="swatch c-${c}" data-q="intensity" data-v="${c}" aria-pressed="false">${COLOR_LABEL[c]}<small>${COLOR_DESC[c]}</small></button>`).join('')}</div></div>
-      <div class="field"><span class="lbl">2. Type</span><div class="row wrap">${Object.entries(TYPES).map(([k, v]) => `<button type="button" class="pill" data-q="type" data-v="${k}" aria-pressed="false">${v}</button>`).join('')}</div></div>
-      <div class="field"><label class="lbl" for="qNote">3. Note (facultatif)</label>
-        <textarea class="input" id="qNote" rows="3" placeholder="Ce qui s'est passé, en quelques mots…"></textarea>
-        <button type="button" class="btn soft block" data-act="dictate">${ico('mic', 22)}Dicter la note</button>
-        <p class="hint">Le clavier s'ouvre : touchez ensuite son micro. Selon le téléphone, la dictée ne démarre pas toute seule.</p></div>
-      <button type="button" class="btn block" id="qSave">Enregistrer</button>
-      <p class="hint">Une intensité, un type ou une note suffit. Vous pourrez compléter plus tard.</p>
+      <div class="sheet-head"><h2 id="qTitle">${resume ? 'Brouillon repris' : 'Nouvel événement'}</h2><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Fermer">${ico('x', 20)}</button></div>
+      <div class="two"><label class="field"><span class="lbl">Date</span><input class="input" type="date" id="qDate" value="${esc(q.date)}" min="${MIN_YEAR}-01-01" max="${today()}"></label>
+      <label class="field"><span class="lbl">Heure</span><input class="input" type="time" id="qTime" value="${esc(q.time)}"></label></div>
+      <div class="field"><span class="lbl">1. Intensité</span><div class="swatches">${COLORS.map((c) => `<button type="button" class="swatch c-${c}" data-q="intensity" data-v="${c}" aria-pressed="${q.intensity === c}">${COLOR_LABEL[c]}<small>${COLOR_DESC[c]}</small></button>`).join('')}</div></div>
+      <div class="field"><span class="lbl">2. Type</span><div class="row wrap">${Object.entries(TYPES).map(([k, v]) => `<button type="button" class="pill" data-q="type" data-v="${k}" aria-pressed="${q.type === k}">${v}</button>`).join('')}</div></div>
+      <div class="field"><label class="lbl" for="qNote">3. Récit (dicté ou tapé)</label>
+        <textarea class="input" id="qNote" rows="5" placeholder="Racontez ce qui s'est passé : où, ce qu'il a fait ou dit, ce que vous avez fait, comment ça s'est terminé…">${esc(q.text)}</textarea>
+        <button type="button" class="btn soft block" data-act="dictate">${ico('mic', 22)}Dicter avec le clavier</button>
+        <p class="hint">Touchez le micro du clavier. Pour que votre voix reste dans le téléphone, activez la dictée hors ligne (Paramètres › Dictée vocale). Relisez et corrigez le texte avant de continuer.</p></div>
+      <button type="button" class="btn block" id="qOrganize">Organiser l'observation</button>
+      ${q.eventId ? '' : '<button type="button" class="btn quiet block" id="qSave">Enregistrer sans organiser</button>'}
+      <p class="hint">Le brouillon est gardé automatiquement (chiffré) : vous pouvez fermer et reprendre plus tard.</p>
     </section></div>`;
+    const sync = () => { q.date = $('#qDate').value || today(); q.time = $('#qTime').value || ''; q.text = $('#qNote').value; queueDraft(q); };
+    ['#qDate', '#qTime', '#qNote'].forEach((s) => $(s).addEventListener('input', sync));
     $('.sheet', root).addEventListener('click', (ev) => {
       ev.stopPropagation();
       const b = ev.target.closest('[data-q]');
@@ -483,22 +548,160 @@
         const key = b.dataset.q; const val = b.dataset.v;
         q[key] = q[key] === val ? null : val;
         $$(`[data-q="${key}"]`, root).forEach((x) => x.setAttribute('aria-pressed', String(q[key] === x.dataset.v)));
+        sync();
         return;
       }
       const a = ev.target.closest('[data-act]');
       if (a) handleAct(a, ev);
     });
-    $('#qSave').onclick = async () => {
-      const note = $('#qNote').value.trim();
+    if ($('#qSave')) $('#qSave').onclick = async () => {
+      sync();
+      const note = q.text.trim();
       if (!q.intensity && !q.type && !note) { toast('Choisissez au moins une intensité, un type ou écrivez une note.'); return; }
-      const ev = { id: uid(), kind: 'event', date: $('#qDate').value || today(), time: $('#qTime').value || '', type: q.type, intensity: q.intensity, note, author: S.settings.parent || '', createdAt: nowIso(), comments: [] };
+      const ev = { id: uid(), kind: 'event', date: q.date, time: q.time, type: q.type, intensity: q.intensity, note, author: S.settings.parent || '', createdAt: nowIso(), comments: [] };
       await saveEvent(ev);
+      await dropDraft(q.id);
       closeSheets();
       S.selected = ev.date; S.month = null;
       if (S.view !== 'journal') S.view = 'calendar';
       render();
       toast(isIncomplete(ev) ? 'Enregistré · à compléter plus tard' : 'Événement enregistré', { label: 'Détails', run: () => openDetail(ev.id) });
     };
+    $('#qOrganize').onclick = async () => {
+      sync();
+      if (!q.text.trim()) { toast('Écrivez ou dictez d\'abord le récit.'); $('#qNote').focus(); return; }
+      startReview(q);
+      await writeDraft(q);
+      openReview(q.id);
+    };
+  }
+
+  // ---------- Organisation et validation ----------
+  // Prépare le brouillon pour l'écran de vérification (classement local, rien n'est envoyé)
+  function startReview(d, existing = null) {
+    const r = OR.organize(d.text, { type: d.type, childName: childName() });
+    d.step = 'review';
+    d.original = d.text; // figé : c'est ce texte qui sera conservé tel quel
+    d.items = r.items;
+    d.sections = { ...r.sections };
+    // Fiche déjà existante : ce qui était déjà écrit dans une section est gardé en tête (rien n'est perdu)
+    if (existing) for (const k of STRUCT_FIELDS) { const old = (existing[k] || '').trim(); if (old && !d.sections[k].includes(old)) d.sections[k] = d.sections[k] ? `${old}\n${d.sections[k]}` : old; }
+    d.kept = existing ? Object.fromEntries(STRUCT_FIELDS.map((k) => [k, (existing[k] || '').trim()])) : null;
+    d.categories = existing && (existing.categories || []).length ? [...existing.categories] : r.categories.map((c) => c.key);
+    d.catWhy = Object.fromEntries(r.categories.map((c) => [c.key, c.why]));
+    d.questions = r.questions;
+    d.flags = r.flags;
+    d.edited = false;
+  }
+  function rebuildFromItems(d) {
+    const b = OR.build(d.items, { type: d.type, text: d.original });
+    d.sections = { ...b.sections };
+    if (d.kept) for (const k of STRUCT_FIELDS) { const old = d.kept[k]; if (old && !d.sections[k].includes(old)) d.sections[k] = d.sections[k] ? `${old}\n${d.sections[k]}` : old; }
+    d.questions = b.questions.filter((qq) => !d.sections[qq.section]);
+  }
+
+  function openReview(draftId) {
+    const d = S.drafts.get(draftId) || (liveDraft && liveDraft.id === draftId ? liveDraft : null);
+    if (!d) { toast('Ce brouillon n\'existe plus.'); return; }
+    liveDraft = d;
+    const root = $('#sheet-root');
+    const label = (k) => esc(fieldLabel(SECTION_LABELS[k]));
+    const opts = (sel) => STRUCT_FIELDS.map((k) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${label(k)}</option>`).join('');
+    const flags = (d.flags || []).length ? `<div class="banner warn"><span class="spacer"><strong>À vérifier :</strong> ${d.flags.map((f) => `« ${esc(f.word)} »`).join(', ')}.<br><span class="small">${esc(d.flags[0].tip)} L'application ne réécrit pas vos phrases : vous pouvez les corriger ci-dessous.</span></span></div>` : '';
+    root.innerHTML = `<div class="panel" role="dialog" aria-modal="true" aria-labelledby="rTitle"><div class="panel-inner">
+      <div class="panel-head"><button type="button" class="icon-btn plain" data-r="back" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="rTitle">Vérifier l'observation</span></div>
+      <p class="hint pad-hint">Proposition faite dans ce téléphone par des règles simples, sans intelligence artificielle : vos phrases sont rangées, pas réécrites. Rien n'est enregistré dans le journal avant votre approbation.</p>
+      <section class="card"><details><summary><strong>Texte original</strong> <span class="small muted">(conservé tel quel)</span></summary><p class="original">${esc(d.original)}</p></details></section>
+      ${flags}
+      <section class="card"><h3 class="card-title">Classement proposé</h3>
+        <p class="hint">Chaque phrase est rangée dans une section. Changez la section si elle ne convient pas.</p>
+        <div class="list">${d.items.map((it, i) => `<div class="sent"><p>${esc(it.text)}</p><label class="sr" for="it${i}">Section</label><select class="input" id="it${i}" data-item="${i}">${opts(it.section)}</select><p class="small muted">Pourquoi : ${esc(it.why)}</p></div>`).join('') || '<p class="empty-note">Aucune phrase.</p>'}</div></section>
+      ${(d.questions || []).length ? `<section class="card"><h3 class="card-title">Questions facultatives</h3><p class="hint">Répondez si vous le souhaitez, ou ignorez-les.</p>
+        ${d.questions.map((qq, i) => `<div class="field"><label class="lbl" for="q${i}">${esc(qq.text)}</label><textarea class="input" rows="2" id="q${i}"></textarea><div class="row"><button type="button" class="btn small quiet" data-qa="${i}">Ajouter à « ${label(qq.section)} »</button><button type="button" class="btn small quiet" data-qi="${i}">Ignorer</button></div></div>`).join('')}</section>` : ''}
+      <section class="card"><h3 class="card-title">Observation structurée</h3>
+        <p class="hint">Corrigez librement chaque section. Une section sans information reste vide.</p>
+        ${STRUCT_FIELDS.map((k) => `<label class="field"><span class="lbl">${label(k)} <span class="small muted">· ${esc(SECTION_HINTS[k])}</span></span><textarea class="input" rows="${d.sections[k] ? 3 : 2}" data-sec="${k}">${esc(d.sections[k])}</textarea></label>`).join('')}</section>
+      <section class="card"><h3 class="card-title">Catégories</h3><p class="hint">Suggérées selon les mots du récit. Touchez pour ajouter ou retirer.</p>
+        <div class="row wrap">${OR.CATEGORIES.map(([k, l]) => `<button type="button" class="pill" data-cat="${k}" aria-pressed="${d.categories.includes(k)}">${esc(l)}</button>`).join('')}</div>
+        ${Object.keys(d.catWhy || {}).length ? `<p class="small muted">Mots repérés : ${Object.entries(d.catWhy).map(([k, w]) => `${esc(OR.CATEGORY_LABEL[k])} (${esc(w.join(', '))})`).join(' · ')}</p>` : ''}</section>
+      <section class="card"><button type="button" class="btn block" id="rApprove">Approuver et enregistrer</button>
+        <p class="hint">Vous approuvez cette version, au nom de ${esc(S.settings.parent || 'ce téléphone')}. Le texte original est conservé avec elle.</p>
+        <button type="button" class="btn quiet block" data-r="later">Garder en brouillon</button>
+        <button type="button" class="btn danger-ghost block" data-r="discard">Supprimer le brouillon</button></section>
+    </div></div>`;
+    const panel = $('.panel', root);
+    const readSections = () => { $$('[data-sec]', panel).forEach((t) => { d.sections[t.dataset.sec] = t.value; }); };
+    $$('[data-sec]', panel).forEach((t) => t.addEventListener('input', () => { d.edited = true; readSections(); queueDraft(d); }));
+    $$('[data-item]', panel).forEach((s) => s.addEventListener('change', async () => {
+      if (d.edited && !(await ask({ title: 'Reclasser la phrase ?', text: 'Les sections seront reconstruites à partir du classement : vos corrections manuelles dans les sections seront remplacées.', ok: 'Reclasser' }))) { s.value = d.items[Number(s.dataset.item)].section; return; }
+      d.items[Number(s.dataset.item)].section = s.value;
+      d.items[Number(s.dataset.item)].why = 'choisi par vous';
+      d.edited = false;
+      rebuildFromItems(d);
+      await writeDraft(d);
+      const y = panel.scrollTop; openReview(d.id); $('.panel').scrollTop = y;
+    }));
+    panel.addEventListener('click', async (ev) => {
+      const cat = ev.target.closest('[data-cat]');
+      if (cat) { const k = cat.dataset.cat; d.categories = d.categories.includes(k) ? d.categories.filter((x) => x !== k) : [...d.categories, k]; cat.setAttribute('aria-pressed', String(d.categories.includes(k))); queueDraft(d); return; }
+      const qa = ev.target.closest('[data-qa]'); const qi = ev.target.closest('[data-qi]');
+      if (qa || qi) {
+        const i = Number((qa || qi).dataset.qa ?? (qa || qi).dataset.qi);
+        const qq = d.questions[i];
+        if (qa) {
+          const ans = $(`#q${i}`).value.trim();
+          if (!ans) { toast('Écrivez une réponse, ou touchez « Ignorer ».'); return; }
+          readSections();
+          d.sections[qq.section] = d.sections[qq.section] ? `${d.sections[qq.section]} ${OR.tidy(ans)}` : OR.tidy(ans);
+          d.answers = [...(d.answers || []), { q: qq.text, a: ans }];
+          d.edited = true;
+        }
+        d.questions = d.questions.filter((_, j) => j !== i);
+        await writeDraft(d);
+        const y = panel.scrollTop; openReview(d.id); $('.panel').scrollTop = y;
+        return;
+      }
+      const r = ev.target.closest('[data-r]');
+      if (!r) return;
+      if (r.dataset.r === 'back') { d.step = 'text'; readSections(); await writeDraft(d); openQuick(null, d); return; }
+      if (r.dataset.r === 'later') { readSections(); await writeDraft(d); liveDraft = null; closeSheets(); render(); toast('Brouillon gardé'); return; }
+      if (r.dataset.r === 'discard') {
+        if (!(await ask({ title: 'Supprimer ce brouillon ?', text: 'Le récit et l\'organisation proposée seront effacés de ce téléphone. Rien n\'a encore été enregistré dans le journal.', ok: 'Supprimer', danger: true }))) return;
+        await dropDraft(d.id); closeSheets(); render(); toast('Brouillon supprimé');
+      }
+    });
+    $('#rApprove').onclick = async () => {
+      readSections();
+      const sec = Object.fromEntries(STRUCT_FIELDS.map((k) => [k, (d.sections[k] || '').trim()]));
+      if (!Object.values(sec).some(Boolean)) { toast('Toutes les sections sont vides.'); return; }
+      const ok = await ask({ title: 'Approuver cette observation ?', text: 'Elle sera enregistrée dans le journal, partagée avec l\'autre parent, avec le texte original. Vous pourrez encore la modifier ensuite (il faudra alors l\'approuver de nouveau).', ok: 'Approuver' });
+      if (!ok) return;
+      let ev = d.eventId ? S.events.get(d.eventId) : null;
+      let changedUnder = null;
+      if (ev && d.baseVersion != null && ev.syncVersion !== d.baseVersion && !ev.conflict) changedUnder = { ...JS.eventToRow(ev), version: ev.syncVersion, created_at: ev.createdAt, updated_at: ev.updatedAt, author_id: ev.authorId, updated_by: ev.updatedById };
+      if (!ev) ev = { id: uid(), kind: 'event', date: d.date, time: d.time, type: d.type, intensity: d.intensity, note: d.original.trim(), author: S.settings.parent || '', createdAt: nowIso(), comments: [] };
+      else { ev.type = ev.type || d.type; ev.intensity = ev.intensity || d.intensity; }
+      Object.assign(ev, sec);
+      if (!ev.originalText) ev.originalText = d.original; // jamais remplacé une fois enregistré
+      ev.categories = JS.CATEGORY_ORDER.filter((c) => d.categories.includes(c));
+      ev.hasStructure = true; ev.approvalVoid = false; ev.approveRequest = uid(); // demande d'approbation explicite (envoyée avec la version relue)
+      if (changedUnder) ev.conflict = { row: changedUnder, at: nowIso() };
+      await saveEvent(ev);
+      await dropDraft(d.id);
+      closeSheets(); S.selected = ev.date; S.month = null; if (S.view !== 'journal') S.view = 'calendar'; render();
+      toast(changedUnder ? 'Approuvée · l\'autre parent a aussi modifié la fiche, choisissez la version' : 'Observation enregistrée · approbation envoyée, en attente de confirmation', { label: 'Voir', run: () => openDetail(ev.id) });
+    };
+  }
+  function organizeExisting(id) {
+    const e = S.events.get(id);
+    if (!e) return;
+    const existing = [...S.drafts.values()].find((x) => x.eventId === id);
+    if (existing) { if (existing.step === 'review') openReview(existing.id); else openQuick(null, existing); return; }
+    const text = e.originalText || e.note || '';
+    const d = newDraft({ date: e.date, time: e.time || '', intensity: e.intensity, type: e.type, text, eventId: id, baseVersion: e.syncVersion ?? null });
+    if (!text.trim()) { liveDraft = d; openQuick(null, d); return; }
+    startReview(d, e);
+    writeDraft(d).then(() => openReview(d.id));
   }
 
   // ---------- Fiche détaillée ----------
@@ -521,6 +724,10 @@
       <div class="panel-head"><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="dTitle">Fiche de l'événement</span><button type="button" class="btn small" id="dSave">Enregistrer</button></div>
       ${e.conflict ? `<div class="banner warn"><span class="spacer">Cette fiche a aussi été modifiée sur l'autre téléphone.</span><button type="button" class="btn small quiet" data-act="conflicts">Choisir</button></div>` : ''}
       ${e.syncError ? `<div class="banner warn"><span class="spacer">Pas encore envoyée : ${esc(e.syncError)}</span></div>` : ''}
+      ${isStructured(e) ? `<section class="card"><div class="row"><strong class="spacer">${isApproved(e) ? '✓ ' : ''}${approvalLine(e)}</strong>${isApproved(e) || (isApprovalPending(e) && !e.conflict && !e.syncError) ? '' : '<button type="button" class="btn small" id="dApprove">Approuver</button>'}</div>
+        ${isApproved(e) ? '<p class="hint">Si vous modifiez son contenu (sections, note, date, heure, endroit, catégories…), il faudra l\'approuver de nouveau.</p>' : isApprovalPending(e) && !e.conflict && !e.syncError ? '<p class="hint">La fiche n\'est pas encore approuvée : le serveur doit d\'abord confirmer.</p>' : '<p class="hint">Relisez les sections ci-dessous, puis approuvez cette version.</p>'}
+        ${e.originalText ? `<details><summary>Texte original <span class="small muted">(verrouillé, jamais modifié)</span></summary><p class="original">${esc(e.originalText)}</p></details>` : ''}</section>`
+        : (e.note || '').trim() ? `<section class="card"><button type="button" class="btn soft block" id="dOrganize">Organiser ce récit en sections</button><p class="hint">Proposition faite dans ce téléphone, à vérifier et approuver. Rien n'est remplacé sans votre accord.</p></section>` : ''}
       <section class="card">
         <div class="row wrap">${e.intensity ? `<span class="chip-tag c-${e.intensity}">${COLOR_LABEL[e.intensity]} · ${COLOR_DESC[e.intensity]}</span>` : ''}${e.type ? `<span class="chip-tag">${TYPES[e.type]}</span>` : ''}${isIncomplete(e) ? '<span class="chip-tag outline">À compléter</span>' : ''}</div>
         <p class="hint">Noté par ${esc(e.author || 'un parent')} le ${fmtStamp(e.createdAt)}${e.updatedAt && e.updatedAt !== e.createdAt && e.version > 1 ? ` · modifié${e.updatedBy ? ' par ' + esc(e.updatedBy) : ''} le ${fmtStamp(e.updatedAt)}` : ''}</p>
@@ -531,6 +738,7 @@
         <label class="field"><span class="lbl">Note rapide</span><textarea class="input" rows="3" data-f="note">${esc(draft.note || '')}</textarea></label>
         <p class="hint">Tous les champs ci-dessous sont facultatifs.</p>
         ${fieldHtml}
+        <div class="field"><span class="lbl">Catégories</span><div class="row wrap">${OR.CATEGORIES.map(([k, l]) => `<button type="button" class="pill" data-dcat="${k}" aria-pressed="${(draft.categories || []).includes(k)}">${esc(l)}</button>`).join('')}</div></div>
         <label class="check"><input type="checkbox" id="dComplete" ${draft.markedComplete ? 'checked' : ''}> Fiche complète (retirer « À compléter »)</label>
       </section>
       <section class="card"><h3 class="card-title">Commentaires</h3>${comments || '<p class="empty-note">Aucun commentaire.</p>'}
@@ -539,7 +747,7 @@
       <section class="card"><button type="button" class="btn danger-ghost block" id="dDelete">Supprimer cet événement</button><p class="hint">L'événement va dans la corbeille pendant 30 jours avant d'être effacé.</p></section>
     </div></div>`;
     const panel = $('.panel', root);
-    const snap = () => JSON.stringify([draft.intensity, draft.type, ...$$('[data-f]', panel).map((i) => i.value), $('#dComplete').checked, $('#dComment').value]);
+    const snap = () => JSON.stringify([draft.intensity, draft.type, draft.categories || [], ...$$('[data-f]', panel).map((i) => i.value), $('#dComplete').checked, $('#dComment').value]);
     const initial = snap();
     panel.addEventListener('click', async (ev) => {
       const back = ev.target.closest('[data-act="closeSheet"]');
@@ -549,6 +757,12 @@
       }
       const b = ev.target.closest('[data-d]');
       if (b) { const k = b.dataset.d; draft[k] = draft[k] === b.dataset.v ? null : b.dataset.v; $$(`[data-d="${k}"]`, panel).forEach((x) => x.setAttribute('aria-pressed', String(draft[k] === x.dataset.v))); return; }
+      const c = ev.target.closest('[data-dcat]');
+      if (c) { const k = c.dataset.dcat; const cur = draft.categories || []; draft.categories = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k]; c.setAttribute('aria-pressed', String(draft.categories.includes(k))); return; }
+      if (ev.target.closest('#dOrganize')) {
+        if (snap() !== initial && !(await ask({ title: 'Organiser sans enregistrer ?', text: 'Vos modifications non enregistrées de cette fiche seront perdues. Enregistrez d\'abord si vous voulez les garder.', ok: 'Continuer', danger: true }))) return;
+        organizeExisting(id); return;
+      }
       const a = ev.target.closest('[data-act]');
       if (a) handleAct(a, ev);
     });
@@ -560,20 +774,28 @@
       });
       draft.markedComplete = $('#dComplete').checked;
     };
-    $('#dSave').onclick = async () => {
+    const save = async (approve) => {
       collect();
       if (!draft.date) { toast('La date est obligatoire.'); return; }
       const cur = S.events.get(id);
       if (!cur) { toast('Cette fiche n\'existe plus (effacée de la corbeille).'); closeSheets(); render(); return; }
+      if (approve && !(await ask({ title: 'Approuver cette version ?', text: `Vous approuvez les sections et les catégories telles qu'elles sont affichées, au nom de ${esc(S.settings.parent || 'ce téléphone')}.`, ok: 'Approuver' }))) return;
       // Si l'autre parent a modifié la fiche pendant qu'elle était ouverte, on ne l'écrase pas : conflit à trancher.
       const changedUnder = baseVersion != null && cur.syncVersion !== baseVersion && !cur.conflict;
       const before = changedUnder ? { ...JS.eventToRow(cur), version: cur.syncVersion, created_at: cur.createdAt, updated_at: cur.updatedAt, author_id: cur.authorId, updated_by: cur.updatedById } : null;
+      const contentBefore = contentKey(cur);
       for (const k of EDITABLE) if (draft[k] !== undefined) cur[k] = draft[k];
+      cur.categories = JS.CATEGORY_ORDER.filter((c) => (draft.categories || []).includes(c));
+      const structChanged = contentBefore !== contentKey(cur); // tout changement de contenu (comme le serveur)
+      if (approve) { cur.hasStructure = true; cur.approvalVoid = false; cur.approveRequest = uid(); } // demande d'approbation explicite (envoyée avec la version relue)
+      else if (structChanged) { cur.approveRequest = null; if (cur.approval) cur.approvalVoid = true; } // le serveur retire aussi l'approbation
       if (before) cur.conflict = { row: before, at: nowIso() };
       await saveEvent(cur);
       closeSheets(); S.selected = cur.date; S.month = null; render();
-      toast(before ? 'Enregistrée · l\'autre parent l\'a aussi modifiée, choisissez la version' : 'Fiche enregistrée');
+      toast(before ? 'Enregistrée · l\'autre parent l\'a aussi modifiée, choisissez la version' : approve ? 'Approbation envoyée, en attente de confirmation' : structChanged && isStructured(cur) ? 'Fiche enregistrée · à approuver de nouveau' : 'Fiche enregistrée');
     };
+    $('#dSave').onclick = () => save(false);
+    if ($('#dApprove')) $('#dApprove').onclick = () => save(true);
     $('#dAddComment').onclick = async () => {
       const text = $('#dComment').value.trim();
       if (!text) return;
@@ -607,7 +829,7 @@
     if (S.jFilter === 'hard') list = list.filter((e) => HARD_TYPES.includes(e.type));
     if (S.jFilter === 'intense') list = list.filter((e) => e.intensity === 'rouge');
     if (S.jFilter === 'pos') list = list.filter(isPositive);
-    if (q) list = list.filter((e) => [e.note, e.place, e.people, e.context, e.description, e.intervention, e.helped, e.extra, e.childReaction, e.adultReaction, e.stateBefore, TYPES[e.type]].join(' ').toLowerCase().includes(q));
+    if (q) list = list.filter((e) => [e.note, e.place, e.people, e.context, e.description, e.intervention, e.helped, e.extra, e.childReaction, e.adultReaction, e.stateBefore, e.outcome, e.impressions, e.originalText, TYPES[e.type], ...(e.categories || []).map((c) => OR.CATEGORY_LABEL[c])].join(' ').toLowerCase().includes(q));
     list.sort((a, b) => sortEv(b, a));
     let html = `<div class="search">${ico('search', 20)}<label class="sr" for="jq">Rechercher</label><input id="jq" type="search" placeholder="Rechercher (ex. : parc, transition, école)" value="${esc(S.jQuery)}"></div>
       <div class="chips">${filters.map(([k, l]) => `<button type="button" class="pill" data-act="jf" data-f="${k}" aria-pressed="${S.jFilter === k}">${l}</button>`).join('')}</div>`;
@@ -664,6 +886,12 @@
       <section class="card"><h3 class="card-title">Prénom de l'enfant</h3>
         <div class="row"><label class="sr" for="childName">Prénom</label><input class="input" id="childName" maxlength="40" autocomplete="off" value="${esc(childName())}" placeholder="Prénom (facultatif)"><button type="button" class="btn small" data-act="saveChild">Enregistrer</button></div>
         <p class="hint">Affiché seulement quand l'application est déverrouillée. Enregistré chiffré dans ce téléphone, jamais dans le code public. L'écran de verrouillage et l'icône affichent « ${NEUTRAL_TITLE} ».</p></section>
+      <section class="card"><h3 class="card-title">Dictée vocale</h3>
+        <p class="hint">L'application n'écoute jamais le micro elle-même : la dictée passe par le <strong>micro du clavier</strong> (Gboard sur Android). Par défaut, ce clavier peut envoyer la voix à Google pour la transformer en texte. Pour qu'elle reste dans le téléphone :</p>
+        <ol class="steps"><li>Paramètres Android › Système › Clavier › Gboard › <strong>Saisie vocale</strong> : activez <strong>Reconnaissance vocale hors ligne</strong> (ou « Saisie vocale plus rapide ») et téléchargez le <strong>français</strong>.</li>
+        <li>Gboard › Confidentialité : désactivez le partage d'extraits audio (« Améliorer la reconnaissance vocale » ou équivalent), s'il est proposé.</li>
+        <li><strong>Vérification</strong> : activez le <strong>mode avion</strong>, ouvrez « Nouvel événement » et dictez une phrase. Si le texte apparaît, la reconnaissance se fait dans le téléphone.</li></ol>
+        <p class="hint">Limites : les noms des réglages varient selon le téléphone ; le mode hors ligne peut être un peu moins précis ; Google peut faire évoluer son clavier. En cas de doute, tapez le texte. Les récits eux-mêmes ne sont jamais envoyés à un service d'analyse : l'organisation se fait dans l'application.</p></section>
       <section class="card"><h3 class="card-title">Sécurité de ce téléphone</h3>
         <div class="set-row"><span>Verrouillage automatique</span><span class="muted">après 5 min</span></div>
         <button type="button" class="btn quiet block" data-act="lockNow">${ico('lock', 18)}Verrouiller maintenant</button>
@@ -685,7 +913,7 @@
         <p class="hint">Pour tester l'application. Ces exemples sont inventés et marqués « [Exemple] ».</p>
         <button type="button" class="btn danger-ghost block" data-act="wipe">Effacer toutes les données de ce téléphone</button></section>
       <section class="card"><h3 class="card-title">Confidentialité</h3>
-        <p class="hint">Dans ce téléphone, les observations et la connexion sont chiffrées (AES-256) avec une clé que l'application peut utiliser mais pas lire. Une fois connecté, elles sont aussi envoyées en HTTPS à votre espace Supabase privé, lisible seulement par les comptes de Papa et Maman. Les données fictives (« [Exemple] ») restent dans ce téléphone. Limite : quelqu'un qui aurait votre téléphone déverrouillé et des outils techniques avancés pourrait contourner le code de l'app ; d'où l'importance du verrouillage d'écran Android. Aucun diagnostic n'est établi par cette application.</p>
+        <p class="hint">Dans ce téléphone, les observations et la connexion sont chiffrées (AES-256) avec une clé que l'application peut utiliser mais pas lire. Une fois connecté, elles sont aussi envoyées en HTTPS à votre espace Supabase privé, lisible seulement par les comptes de Papa et Maman. Les données fictives (« [Exemple] ») et les brouillons restent dans ce téléphone. L'organisation des récits en sections se fait dans l'application, par des règles simples : aucun récit n'est envoyé à un service d'analyse ou d'intelligence artificielle. Limite : quelqu'un qui aurait votre téléphone déverrouillé et des outils techniques avancés pourrait contourner le code de l'app ; d'où l'importance du verrouillage d'écran Android. Aucun diagnostic n'est établi par cette application.</p>
         <p class="hint">Version ${APP_VERSION}</p></section>`;
     $('#importFile').addEventListener('change', importFile);
   }
@@ -698,7 +926,7 @@
     a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
-  function snapshot() { return { events: [...S.events.values()], days: [...S.days.values()] }; }
+  function snapshot() { return { events: [...S.events.values()], days: [...S.days.values()], drafts: [...S.drafts.values()] }; }
   async function doExport(mode) {
     const stamp = today();
     let file;
@@ -745,7 +973,8 @@
     const toWrite = [];
     let added = 0, updated = 0;
     // Ce qui est restauré est renvoyé au serveur ; une différence avec la version partagée devient un conflit à trancher.
-    const mark = (o, cur) => { o.conflict = null; o.syncError = null; o.syncVersion = cur ? cur.syncVersion : o.syncVersion; o.rev = ((cur && cur.rev) || 0) + 1; o.dirty = !o.localOnly; if (cur && cur.comments && o.kind === 'event') { const ids = new Set((o.comments || []).map((c) => c.id)); o.comments = [...(o.comments || []), ...cur.comments.filter((c) => !ids.has(c.id))]; } };
+    // Une approbation n'est jamais reprise d'un fichier : seule une approbation faite dans l'app compte.
+    const mark = (o, cur) => { o.conflict = null; o.syncError = null; o.syncVersion = cur ? cur.syncVersion : o.syncVersion; o.rev = ((cur && cur.rev) || 0) + 1; o.dirty = !o.localOnly; if (o.kind === 'event') { o.approveRequest = null; o.approval = cur ? cur.approval || null : null; o.approvalVoid = false; if (cur && cur.originalText) o.originalText = cur.originalText; } if (cur && cur.comments && o.kind === 'event') { const ids = new Set((o.comments || []).map((c) => c.id)); o.comments = [...(o.comments || []), ...cur.comments.filter((c) => !ids.has(c.id))]; } };
     for (const e of evs) {
       const cur = S.events.get(e.id);
       if (!cur) { added++; mark(e, null); S.events.set(e.id, e); toWrite.push(e); }
@@ -754,6 +983,11 @@
     for (const d of days) {
       const cur = S.days.get(d.date);
       if (!cur || (d.updatedAt || '') > (cur.updatedAt || '')) { if (cur) d.id = cur.id; mark(d, cur); S.days.set(d.date, d); toWrite.push(d); if (cur) updated++; else added++; }
+    }
+    // Brouillons de la sauvegarde : ajoutés s'ils manquent (jamais envoyés au serveur)
+    for (const d of (data.drafts || []).filter((x) => x && x.kind === 'draft' && /^draft-/.test(String(x.id)))) {
+      const cur = S.drafts.get(d.id);
+      if (!cur || (d.updatedAt || '') > (cur.updatedAt || '')) { S.drafts.set(d.id, d); toWrite.push(d); if (cur) updated++; else added++; }
     }
     const sealed = [];
     for (const o of toWrite) sealed.push(await seal(o));
@@ -848,8 +1082,8 @@
   function conflictRows(c) {
     const theirs = c.o.conflict.row;
     const mine = c.kind === 'event' ? JS.eventToRow(c.o) : JS.dayToRow(c.o);
-    const cols = JS.diffCols(mine, theirs, c.kind === 'event' ? JS.EVENT_COLS : JS.DAY_COLS);
-    const show = (col, v) => { const t = JS.describe(col, v); return col === 'type' && TYPES[v] ? TYPES[v] : (col === 'intensity' || col === 'rating') && COLOR_LABEL[v] ? COLOR_LABEL[v] : t; };
+    const cols = JS.diffCols(mine, theirs, c.kind === 'event' ? JS.ALL_EVENT_COLS : JS.DAY_COLS).filter((col) => !(col === 'categories' && mine.categories === undefined));
+    const show = (col, v) => { if (col === 'categories') return (v || []).length ? v.map((k) => OR.CATEGORY_LABEL[k] || k).join(', ') : '(aucune)'; const t = JS.describe(col, v); return col === 'type' && TYPES[v] ? TYPES[v] : (col === 'intensity' || col === 'rating') && COLOR_LABEL[v] ? COLOR_LABEL[v] : t; };
     return cols.map((col) => `<tr><th scope="row">${esc(JS.FIELD_LABELS[col] || col)}</th><td>${esc(show(col, mine[col]))}</td><td>${esc(show(col, theirs[col]))}</td></tr>`).join('');
   }
   function openConflicts() {
@@ -924,9 +1158,11 @@
         S.events.delete(el.dataset.id); await recDelete([el.dataset.id]); render(); break;
       }
       case 'demo': await addDemo(); break;
+      case 'resumeDraft': resumeDraft(el.dataset.id); break;
       case 'wipe': {
         const n = pendingCount();
-        const v = await ask({ title: 'Effacer toutes les données ?', text: `Toutes les observations, le code et la clé de chiffrement de <strong>ce téléphone</strong> seront supprimés.${n ? ` <strong>Attention : ${n} élément(s) n'ont pas encore été envoyés et seraient perdus.</strong> Synchronisez ou faites une sauvegarde d'abord.` : S.loggedIn ? ' Ce qui est déjà synchronisé reste sur le serveur et reviendra à la prochaine connexion.' : ' Faites d\'abord une sauvegarde si nécessaire.'}`, ok: 'Effacer', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+        const nd = S.drafts.size;
+        const v = await ask({ title: 'Effacer toutes les données ?', text: `Toutes les observations, le code et la clé de chiffrement de <strong>ce téléphone</strong> seront supprimés.${n ? ` <strong>Attention : ${n} élément(s) n'ont pas encore été envoyés et seraient perdus.</strong> Synchronisez ou faites une sauvegarde d'abord.` : S.loggedIn ? ' Ce qui est déjà synchronisé reste sur le serveur et reviendra à la prochaine connexion.' : ' Faites d\'abord une sauvegarde si nécessaire.'}${nd ? ` <strong>${nd} brouillon(s) non terminé(s) seraient aussi perdus</strong> (les brouillons ne sont jamais envoyés).` : ''}`, ok: 'Effacer', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
         if (!v) return;
         stopSync(); await wipeAll(); location.reload(); break;
       }
@@ -963,10 +1199,12 @@
   setInterval(() => { if (S.unlocked && Date.now() - lastActivity >= LOCK_MS) lock(); }, 10000);
 
   function lock() {
+    flushDraft(); // le brouillon ouvert est écrit (chiffré) avant que la clé quitte la mémoire
+    liveDraft = null;
     stopSync();
     S.unlocked = false; S.loggedIn = false; S.session = null; S.sync = { status: 'idle', msg: '' };
     DEK = null;
-    S.events.clear(); S.days.clear(); S.settings = null;
+    S.events.clear(); S.days.clear(); S.drafts.clear(); S.settings = null;
     closeSheets(); $('#modal-root').innerHTML = ''; $('#toast').hidden = true;
     view().innerHTML = '';
     $('#shell').hidden = true;
@@ -1046,7 +1284,7 @@
       },
     });
     $('#forgot').onclick = async () => {
-      const v = await ask({ title: 'Code oublié', text: 'Le code protège les données de ce téléphone : sans lui, il faut les effacer. Vous pourrez ensuite vous reconnecter avec votre compte et retrouver tout ce qui a déjà été synchronisé. <strong>Ce qui n\'avait pas encore été envoyé (par exemple noté hors ligne) serait perdu</strong> ; essayez d\'abord de vous souvenir du code.', ok: 'Effacer ce téléphone', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+      const v = await ask({ title: 'Code oublié', text: 'Le code protège les données de ce téléphone : sans lui, il faut les effacer. Vous pourrez ensuite vous reconnecter avec votre compte et retrouver tout ce qui a déjà été synchronisé. <strong>Ce qui n\'avait pas encore été envoyé (par exemple noté hors ligne) et les brouillons non terminés seraient perdus</strong> ; essayez d\'abord de vous souvenir du code.', ok: 'Effacer ce téléphone', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
       if (v) { await wipeAll(); location.reload(); }
     };
   }
@@ -1082,6 +1320,15 @@
     try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) { /* facultatif */ }
     if ('serviceWorker' in navigator && location.protocol === 'https:' && !window.__JM_PREVIEW__) {
       try { await navigator.serviceWorker.register('sw.js'); } catch (e) { /* hors ligne indisponible */ }
+    }
+    // Mise à jour en cours : si le navigateur a mélangé d'anciens et de nouveaux fichiers,
+    // l'app ne démarre pas (aucune lecture ni écriture des données) et propose de recharger.
+    if (!JS || JS.VERSION !== APP_VERSION || !OR || OR.VERSION !== APP_VERSION) {
+      document.body.innerHTML = '<main class="lock"><section class="card"><h1>Mise à jour en cours</h1>'
+        + '<p>Une nouvelle version du journal s\'installe. Vos observations restent dans ce téléphone, rien n\'est effacé.</p>'
+        + '<button type="button" class="btn block" id="jmReload">Recharger</button></section></main>';
+      document.getElementById('jmReload').addEventListener('click', () => location.reload());
+      return;
     }
     await showLock();
   }
