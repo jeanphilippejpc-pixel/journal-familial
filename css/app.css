@@ -200,3 +200,16 @@ textarea.input { resize: vertical; line-height: 1.45; }
 }
 
 .pad-hint { margin: 14px 20px 0; }
+
+/* Phase 3 : état de la synchronisation et conflits */
+.top-actions { display: flex; align-items: center; gap: 8px; }
+.sync-chip { min-height: 32px; padding: 0 10px; border-radius: 16px; border: 1px solid var(--line2); background: var(--surface); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
+.sync-chip:empty { display: none; }
+.sync-chip.ok { color: var(--vert); border-color: #BFE3CD; background: var(--vert-bg); }
+.sync-chip.warn { color: var(--jaune); border-color: #EAD9A0; background: var(--jaune-bg); }
+.sync-chip.err { color: var(--rouge); border-color: #EBB8B2; background: var(--rouge-bg); }
+.cmp-wrap { overflow-x: auto; }
+.cmp { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cmp th, .cmp td { text-align: left; vertical-align: top; padding: 8px 6px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.cmp thead th { color: var(--muted); font-weight: 700; font-size: 12px; }
+.cmp tbody th { color: var(--muted); font-weight: 600; width: 30%; }

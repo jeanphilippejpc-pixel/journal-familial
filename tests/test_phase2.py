@@ -1,4 +1,4 @@
-"""Tests de bout en bout de la phase 2 (données fictives uniquement).
+"""Tests de bout en bout des fonctions locales (phase 2, toujours valables en phase 3) (données fictives uniquement).
 Lancer : python3 tests/test_phase2.py  (sert le dossier sur http://localhost:8765)
 """
 import http.server, os, socketserver, sys, threading, time, json
@@ -46,6 +46,7 @@ with sync_playwright() as p:
     check('codes différents refusés', 'ne correspondent pas' in page.inner_text('#pinMsg'))
     pin(page, '2580'); pin(page, '2580')
     page.wait_for_selector('#shell:not([hidden])')
+    page.click('#lLater')  # phase 3 : connexion proposée, on la reporte
     page.click('.modal [data-p="Papa"]')
     page.fill('#mInput', 'Prenomfictif'); page.click('#mYes'); page.wait_for_timeout(300)
     check('prénom privé affiché après déverrouillage', page.inner_text('#topSub') == 'Journal de Prenomfictif')
@@ -146,7 +147,7 @@ with sync_playwright() as p:
     page.click('[data-act="wipe"]'); page.fill('#mInput', 'EFFACER'); page.click('#mYes')
     page.wait_for_selector('#lock:not([hidden])'); page.wait_for_timeout(300)
     check('effacement complet → retour au choix du code', 'Choisissez' in page.inner_text('#pinMsg'))
-    pin(page, '3691'); pin(page, '3691'); page.wait_for_selector('#shell:not([hidden])'); page.click('.modal [data-p="Maman"]'); page.click('#mNo'); page.wait_for_timeout(200)
+    pin(page, '3691'); pin(page, '3691'); page.wait_for_selector('#shell:not([hidden])'); page.click('#lLater'); page.click('.modal [data-p="Maman"]'); page.click('#mNo'); page.wait_for_timeout(200)
     page.click('#gearBtn')
     page.set_input_files('#importFile', path)
     page.fill('#mInput', 'mauvais-mot'); page.click('#mYes'); page.wait_for_timeout(1500)

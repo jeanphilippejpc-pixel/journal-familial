@@ -1,12 +1,15 @@
-/* Journal familial — application (phase 2 : fonctionnement local)
- * Aucune bibliothèque externe. Aucune donnée n'est envoyée sur Internet dans cette phase.
- * Les observations sont chiffrées (AES-GCM 256) avant d'être écrites dans le stockage du navigateur.
+/* Journal familial — application (phase 3 : comptes et synchronisation)
+ * Aucune bibliothèque externe. Les observations sont chiffrées (AES-GCM 256) avant d'être écrites
+ * dans le stockage du navigateur, puis envoyées en HTTPS à Supabase pour les deux parents (js/sync.js).
  */
 (() => {
   'use strict';
 
   // ---------- Constantes ----------
-  const APP_VERSION = '0.2.0';
+  const APP_VERSION = '0.3.0';
+  const CFG = window.JF_CONFIG;
+  const JS = window.JFSync;
+  const SYNC_EVERY_MS = 60 * 1000;
   const DB_NAME = 'journal-familial';
   const NEUTRAL_TITLE = 'Journal familial';
   const DB_VER = 1;
@@ -25,6 +28,7 @@
   const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
   const DOW = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
   const PLACES = ['Maison', 'École', 'Garderie', 'Voiture', 'Sortie', 'Parc', 'Chez la famille', 'Magasin'];
+  const EDITABLE = ['date', 'time', 'intensity', 'type', 'note', 'markedComplete', 'duration', 'place', 'people', 'stateBefore', 'context', 'description', 'adultReaction', 'intervention', 'childReaction', 'calmTime', 'helped', 'extra'];
   const DETAIL_FIELDS = [
     ['duration', 'Durée approximative (minutes)', 'number'],
     ['place', 'Endroit', 'place'],
@@ -100,6 +104,7 @@
   async function metaSet(k, v) { const d = await db(); const t = d.transaction('meta', 'readwrite'); t.objectStore('meta').put(v, k); return txDone(t); }
   async function recAll() { const d = await db(); return new Promise((res, rej) => { const r = d.transaction('records').objectStore('records').getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
   async function recPut(list) { const d = await db(); const t = d.transaction('records', 'readwrite'); const s = t.objectStore('records'); list.forEach((x) => s.put(x)); return txDone(t); }
+  async function recGet(id) { const d = await db(); return new Promise((res, rej) => { const r = d.transaction('records').objectStore('records').get(id); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
   async function recDelete(ids) { const d = await db(); const t = d.transaction('records', 'readwrite'); const s = t.objectStore('records'); ids.forEach((id) => s.delete(id)); return txDone(t); }
   async function wipeAll() {
     try { const d = await db(); d.close(); } catch (e) { /* rien */ }
@@ -150,40 +155,135 @@
     selected: today(),
     jFilter: 'tous',
     jQuery: '',
+    syncState: null, // curseurs, noms des parents, dernière synchro (chiffré)
+    sync: { status: 'idle', msg: '' }, // idle | running | ok | offline | error | auth | denied | none
+    loggedIn: false,
   };
   const defaultSettings = () => ({ id: 'settings', kind: 'settings', parent: '', lastExport: null, createdAt: nowIso() });
 
   async function loadAll() {
     S.events.clear(); S.days.clear();
-    S.settings = null;
+    S.settings = null; S.syncState = null;
     const recs = await recAll();
     for (const r of recs) {
+      if (r.id === 'session') continue; // lu seulement par le client de synchro
       let o;
       try { o = await unseal(r); } catch (e) { console.warn('Enregistrement illisible ignoré'); continue; }
       if (o.kind === 'event') S.events.set(o.id, o);
       else if (o.kind === 'day') { const ex = S.days.get(o.date); if (!ex || ex.updatedAt < o.updatedAt) S.days.set(o.date, o); }
       else if (o.kind === 'settings') S.settings = o;
+      else if (o.kind === 'sync') S.syncState = o;
     }
     if (!S.settings) { S.settings = defaultSettings(); await saveSettings(); }
+    if (!S.syncState) S.syncState = { id: 'sync', kind: 'sync', names: {} };
     await purgeTrash();
   }
   async function saveRecord(o) { await recPut([await seal(o)]); }
   async function saveSettings() { await saveRecord(S.settings); }
   async function saveEvent(ev, { touch = true } = {}) {
-    if (touch) { ev.updatedAt = nowIso(); ev.updatedBy = S.settings.parent || ''; ev.version = (ev.version || 0) + 1; }
+    if (touch) { ev.updatedAt = nowIso(); ev.updatedBy = S.settings.parent || ''; ev.version = (ev.version || 0) + 1; ev.dirty = true; ev.rev = (ev.rev || 0) + 1; ev.syncError = null; }
     S.events.set(ev.id, ev);
     await saveRecord(ev);
+    scheduleSync();
   }
   async function saveDay(day) {
-    day.updatedAt = nowIso(); day.updatedBy = S.settings.parent || ''; day.version = (day.version || 0) + 1;
+    day.updatedAt = nowIso(); day.updatedBy = S.settings.parent || ''; day.version = (day.version || 0) + 1; day.dirty = true; day.localOnly = false; day.rev = (day.rev || 0) + 1; day.syncError = null;
     S.days.set(day.date, day);
     await saveRecord(day);
+    scheduleSync();
   }
   function getDay(date) { return S.days.get(date) || { id: uid(), kind: 'day', date, rating: null, belle: false, createdAt: nowIso() }; }
+  // Effacement local après 30 jours, seulement pour ce qui n'a jamais été partagé.
+  // Les fiches partagées sont effacées par la synchro, avec l'accord du serveur.
   async function purgeTrash() {
     const limit = Date.now() - TRASH_DAYS * 864e5;
-    const old = [...S.events.values()].filter((e) => e.deletedAt && Date.parse(e.deletedAt) < limit);
+    const old = [...S.events.values()].filter((e) => e.deletedAt && Date.parse(e.deletedAt) < limit && (e.localOnly || e.syncVersion == null));
     if (old.length) { old.forEach((e) => S.events.delete(e.id)); await recDelete(old.map((e) => e.id)); }
+  }
+
+  // ---------- Synchronisation ----------
+  let client = null;
+  let engine = null;
+  let syncTimer = null;
+  let syncInterval = null;
+  let renderNeeded = false;
+  const pendingCount = () => [...S.events.values(), ...S.days.values()].filter(JS.isPending).length
+    + [...S.events.values()].reduce((n, e) => n + (e.comments || []).filter((c) => c.pending).length, 0);
+  const conflicts = () => [...[...S.events.values()].filter((e) => e.conflict).map((e) => ({ kind: 'event', id: e.id, o: e })), ...[...S.days.values()].filter((d) => d.conflict).map((d) => ({ kind: 'day', id: d.date, o: d }))];
+  const syncErrors = () => [...S.events.values(), ...S.days.values()].filter((r) => r.syncError && !r.localOnly);
+  const neverShared = () => [...S.events.values(), ...S.days.values()].filter((r) => !r.localOnly && r.syncVersion == null);
+
+  function setupSync() {
+    const syncStore = {
+      names: (S.syncState && S.syncState.names) || {},
+      events: () => S.events.values(), getEvent: (id) => S.events.get(id),
+      putEvent: async (e) => { if (!DEK) throw new Error('verrouillé'); S.events.set(e.id, e); await saveRecord(e); renderNeeded = true; },
+      removeEvent: async (id) => { S.events.delete(id); await recDelete([id]); renderNeeded = true; },
+      days: () => S.days.values(), getDay: (d) => S.days.get(d),
+      putDay: async (d) => { if (!DEK) throw new Error('verrouillé'); S.days.set(d.date, d); await saveRecord(d); renderNeeded = true; },
+      getState: () => S.syncState,
+      setState: async (st) => { S.syncState = { ...st, id: 'sync', kind: 'sync', names: syncStore.names }; await saveRecord(S.syncState); },
+      myName: () => S.settings.parent || '', uid, now: () => Date.now(),
+    };
+    client = JS.createClient({
+      url: CFG.url, key: CFG.key,
+      loadSession: async () => { const r = await recGet('session'); if (!r || !DEK) return null; try { return (await unseal(r)).s; } catch (e) { return null; } },
+      saveSession: async (s) => { if (!s) { await recDelete(['session']); S.loggedIn = false; return; } if (DEK) await recPut([await seal({ id: 'session', kind: 'session', s })]); S.loggedIn = true; },
+    });
+    engine = JS.createEngine({ client, store: syncStore });
+  }
+  function scheduleSync(delay = 1500) {
+    if (!S.loggedIn || !engine) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(runSync, delay);
+  }
+  async function runSync({ manual = false } = {}) {
+    if (!S.unlocked || !engine || !S.loggedIn) return;
+    S.sync = { status: 'running', msg: '' }; paintSync();
+    try {
+      await engine.sync({ trashDays: TRASH_DAYS });
+      const me = S.session && S.session.user && S.syncState.names[S.session.user.id];
+      if (me && S.settings.parent !== me) { S.settings.parent = me; await saveSettings(); renderNeeded = true; }
+      S.sync = { status: 'ok', msg: '' };
+      if (manual) toast(pendingCount() ? 'Synchronisé, sauf les éléments signalés' : 'Tout est synchronisé');
+    } catch (e) {
+      if (!S.unlocked) return;
+      const kind = e && e.kind;
+      if (kind === 'offline') S.sync = { status: 'offline', msg: 'Hors ligne' };
+      else if (kind === 'auth') { S.sync = { status: 'auth', msg: e.message }; S.loggedIn = false; renderNeeded = true; }
+      else if (kind === 'denied') S.sync = { status: 'denied', msg: e.message };
+      else S.sync = { status: 'error', msg: (e && e.message) || 'Erreur de synchronisation' };
+      if (manual) toast(S.sync.msg);
+    }
+    paintSync();
+    const typing = document.activeElement && document.activeElement.closest && document.activeElement.closest('#view') && /INPUT|TEXTAREA/.test(document.activeElement.tagName);
+    if (renderNeeded && !typing) { renderNeeded = false; render(); }
+  }
+  function startSyncLoop() {
+    clearInterval(syncInterval);
+    syncInterval = setInterval(() => { if (!document.hidden) runSync(); }, SYNC_EVERY_MS);
+  }
+  function stopSync() { clearTimeout(syncTimer); clearInterval(syncInterval); syncTimer = null; syncInterval = null; if (client) client.forget(); client = null; engine = null; }
+  window.addEventListener('online', () => scheduleSync(300));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(500); });
+
+  function syncLabel() {
+    const n = pendingCount();
+    const c = conflicts().length;
+    if (!S.loggedIn) return { cls: 'warn', txt: S.sync.status === 'auth' ? 'Reconnexion requise' : 'Non connecté' };
+    if (c) return { cls: 'warn', txt: `${c} conflit${c > 1 ? 's' : ''}` };
+    if (S.sync.status === 'running') return { cls: '', txt: 'Synchro…' };
+    if (S.sync.status === 'offline') return { cls: 'warn', txt: n ? `Hors ligne · ${n} en attente` : 'Hors ligne' };
+    if (S.sync.status === 'error' || S.sync.status === 'denied' || syncErrors().length) return { cls: 'err', txt: 'Problème de synchro' };
+    if (n) return { cls: '', txt: `${n} en attente` };
+    return { cls: 'ok', txt: 'Synchronisé' };
+  }
+  function paintSync() {
+    const b = $('#syncChip');
+    if (!b || !S.unlocked) return;
+    const l = syncLabel();
+    b.className = 'sync-chip ' + l.cls;
+    b.textContent = l.txt;
   }
 
   // ---------- Prénom (paramètre privé, chiffré ; jamais dans le code public) ----------
@@ -262,6 +362,7 @@
     $('#topTitle').textContent = TITLES[S.view];
     applyTitles(true);
     renderNav();
+    paintSync();
     if (S.view === 'calendar') renderCalendar();
     else if (S.view === 'journal') renderJournal();
     else if (S.view === 'settings') renderSettings();
@@ -276,6 +377,14 @@
     if (last && Date.now() - last < BACKUP_REMINDER_DAYS * 864e5) return '';
     const txt = last ? `Dernière sauvegarde il y a ${Math.floor((Date.now() - last) / 864e5)} jours.` : 'Aucune sauvegarde n\'a encore été faite.';
     return `<div class="banner warn"><span class="spacer">${txt}</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Sauvegarder</button></div>`;
+  }
+  function syncBanner() {
+    const c = conflicts().length;
+    let out = '';
+    if (c) out += `<div class="banner warn"><span class="spacer">${c === 1 ? 'Une fiche a été modifiée' : `${c} fiches ont été modifiées`} sur les deux téléphones en même temps. Choisissez la version à garder.</span><button type="button" class="btn small quiet" data-act="conflicts">Voir</button></div>`;
+    if (!S.loggedIn && !S.settings.loginLater) out += `<div class="banner"><span class="spacer">${S.sync.status === 'auth' ? 'Reconnectez-vous pour reprendre la synchronisation. Vos observations restent dans ce téléphone.' : 'Connectez-vous pour partager le journal entre vos deux téléphones.'}</span><button type="button" class="btn small quiet" data-act="login">Se connecter</button></div>`;
+    else if (S.loggedIn && syncErrors().length) out += `<div class="banner warn"><span class="spacer">Certaines observations n'ont pas pu être envoyées. Elles sont gardées dans ce téléphone.</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Détails</button></div>`;
+    return out;
   }
   function renderCalendar() {
     if (!S.month) { const d = parseYmd(S.selected); S.month = { y: d.getFullYear(), m: d.getMonth() }; }
@@ -303,7 +412,7 @@
     }
     const canPrev = !(y === MIN_YEAR && m === 0);
     const legend = COLORS.map((c) => `<span><i class="sw c-${c}"></i>${COLOR_LABEL[c]}</span>`).join('') + '<span><i class="sw none"></i>Aucune observation</span><span><i class="mark"></i>Réussite</span><span><i class="mark todo"></i>À compléter</span>';
-    view().innerHTML = `${backupBanner()}
+    view().innerHTML = `${syncBanner()}${backupBanner()}
       <section class="card" aria-label="Calendrier du mois">
         <div class="cal-head">
           <button type="button" class="icon-btn plain" data-act="month" data-d="-1" aria-label="Mois précédent" ${canPrev ? '' : 'disabled'}>${ico('left', 20)}</button>
@@ -406,9 +515,12 @@
       if (kind === 'place') return `<label class="field"><span class="lbl">${label}</span><input class="input" list="placesList" data-f="${k}" value="${v}"><datalist id="placesList">${PLACES.map((p) => `<option value="${p}"></option>`).join('')}</datalist></label>`;
       return `<label class="field"><span class="lbl">${label}</span><input class="input" data-f="${k}" value="${v}"></label>`;
     }).join('');
-    const comments = (draft.comments || []).map((c) => `<div class="comment"><strong>${esc(c.author || 'Parent')}</strong> <span class="small muted">${fmtStamp(c.at)}</span><br>${esc(c.text)}</div>`).join('');
+    const baseVersion = e.syncVersion;
+    const comments = (draft.comments || []).map((c) => `<div class="comment"><strong>${esc(c.author || 'Parent')}</strong> <span class="small muted">${fmtStamp(c.at)}${c.pending ? ' · en attente d\'envoi' : ''}</span><br>${esc(c.text)}</div>`).join('');
     root.innerHTML = `<div class="panel" role="dialog" aria-modal="true" aria-labelledby="dTitle"><div class="panel-inner">
       <div class="panel-head"><button type="button" class="icon-btn plain" data-act="closeSheet" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="dTitle">Fiche de l'événement</span><button type="button" class="btn small" id="dSave">Enregistrer</button></div>
+      ${e.conflict ? `<div class="banner warn"><span class="spacer">Cette fiche a aussi été modifiée sur l'autre téléphone.</span><button type="button" class="btn small quiet" data-act="conflicts">Choisir</button></div>` : ''}
+      ${e.syncError ? `<div class="banner warn"><span class="spacer">Pas encore envoyée : ${esc(e.syncError)}</span></div>` : ''}
       <section class="card">
         <div class="row wrap">${e.intensity ? `<span class="chip-tag c-${e.intensity}">${COLOR_LABEL[e.intensity]} · ${COLOR_DESC[e.intensity]}</span>` : ''}${e.type ? `<span class="chip-tag">${TYPES[e.type]}</span>` : ''}${isIncomplete(e) ? '<span class="chip-tag outline">À compléter</span>' : ''}</div>
         <p class="hint">Noté par ${esc(e.author || 'un parent')} le ${fmtStamp(e.createdAt)}${e.updatedAt && e.updatedAt !== e.createdAt && e.version > 1 ? ` · modifié${e.updatedBy ? ' par ' + esc(e.updatedBy) : ''} le ${fmtStamp(e.updatedAt)}` : ''}</p>
@@ -452,17 +564,22 @@
       collect();
       if (!draft.date) { toast('La date est obligatoire.'); return; }
       const cur = S.events.get(id);
-      Object.assign(cur, draft, { comments: cur.comments || [] });
+      if (!cur) { toast('Cette fiche n\'existe plus (effacée de la corbeille).'); closeSheets(); render(); return; }
+      // Si l'autre parent a modifié la fiche pendant qu'elle était ouverte, on ne l'écrase pas : conflit à trancher.
+      const changedUnder = baseVersion != null && cur.syncVersion !== baseVersion && !cur.conflict;
+      const before = changedUnder ? { ...JS.eventToRow(cur), version: cur.syncVersion, created_at: cur.createdAt, updated_at: cur.updatedAt, author_id: cur.authorId, updated_by: cur.updatedById } : null;
+      for (const k of EDITABLE) if (draft[k] !== undefined) cur[k] = draft[k];
+      if (before) cur.conflict = { row: before, at: nowIso() };
       await saveEvent(cur);
       closeSheets(); S.selected = cur.date; S.month = null; render();
-      toast('Fiche enregistrée');
+      toast(before ? 'Enregistrée · l\'autre parent l\'a aussi modifiée, choisissez la version' : 'Fiche enregistrée');
     };
     $('#dAddComment').onclick = async () => {
       const text = $('#dComment').value.trim();
       if (!text) return;
       const cur = S.events.get(id);
-      cur.comments = [...(cur.comments || []), { id: uid(), author: S.settings.parent || '', text, at: nowIso() }];
-      await saveEvent(cur);
+      cur.comments = [...(cur.comments || []), { id: uid(), author: S.settings.parent || '', text, at: nowIso(), pending: true }];
+      await saveEvent(cur, { touch: false }); // un commentaire s'ajoute sans modifier la fiche
       collect();
       const keep = { ...draft };
       openDetail(id);
@@ -519,10 +636,31 @@
   function renderSettings() {
     const trash = [...S.events.values()].filter((e) => e.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
     const last = S.settings.lastExport ? fmtStamp(S.settings.lastExport) : 'jamais';
-    view().innerHTML = `
+    const n = pendingCount();
+    const errs = syncErrors();
+    const cf = conflicts().length;
+    const lastSync = S.syncState && S.syncState.lastSync ? fmtStamp(S.syncState.lastSync) : 'jamais';
+    const email = S.session && S.session.user ? S.session.user.email : '';
+    const account = S.loggedIn ? `
+      <section class="card"><h3 class="card-title">Compte et synchronisation</h3>
+        <div class="set-row"><span>Connecté</span><strong>${esc(S.settings.parent || '…')}</strong></div>
+        <p class="hint">${esc(email)}</p>
+        <div class="set-row"><span>État</span><span class="sync-chip ${syncLabel().cls}">${esc(syncLabel().txt)}</span></div>
+        <div class="set-row"><span>Dernière synchro</span><span class="muted">${lastSync}</span></div>
+        <div class="set-row"><span>En attente d'envoi</span><span class="muted">${n}</span></div>
+        ${cf ? `<button type="button" class="btn block" data-act="conflicts">Résoudre ${cf} conflit${cf > 1 ? 's' : ''}</button>` : ''}
+        ${errs.length ? `<div class="list">${errs.map((r) => `<div class="comment"><strong>${r.kind === 'day' ? 'Journée du ' + fmtShort(r.date) : esc(evTitle(r)) + ' · ' + fmtShort(r.date)}</strong><br>${esc(r.syncError)}</div>`).join('')}</div><p class="hint">Ces éléments restent dans ce téléphone. Corrigez la fiche (par exemple la date) et elle sera renvoyée.</p>` : ''}
+        <button type="button" class="btn quiet block" data-act="syncNow">Synchroniser maintenant</button>
+        <button type="button" class="btn quiet block" data-act="logout">Se déconnecter</button>
+        <p class="hint">Les observations sont envoyées chiffrées (HTTPS) à votre espace Supabase privé. Seuls les comptes de Papa et Maman peuvent les lire. Sans réseau, tout est gardé dans ce téléphone et envoyé au retour de la connexion.</p></section>`
+      : `
+      <section class="card"><h3 class="card-title">Compte et synchronisation</h3>
+        <p class="hint">${S.sync.status === 'auth' ? 'La connexion a expiré. ' : ''}Connectez-vous avec votre compte pour partager le journal entre vos deux téléphones.${n ? ` ${n} élément(s) attendent d'être envoyés.` : ''}</p>
+        <button type="button" class="btn block" data-act="login">Se connecter</button></section>
       <section class="card"><h3 class="card-title">Qui utilise ce téléphone ?</h3>
         <div class="seg">${['Papa', 'Maman'].map((p) => `<button type="button" data-act="parent" data-p="${p}" aria-pressed="${S.settings.parent === p}">${p}</button>`).join('')}</div>
-        <p class="hint">Indiqué sur chaque observation. En phase 3, chaque parent aura son propre compte sécurisé.</p></section>
+        <p class="hint">Indiqué sur chaque observation. Une fois connecté, le nom vient de votre compte.</p></section>`;
+    view().innerHTML = `${account}
       <section class="card"><h3 class="card-title">Prénom de l'enfant</h3>
         <div class="row"><label class="sr" for="childName">Prénom</label><input class="input" id="childName" maxlength="40" autocomplete="off" value="${esc(childName())}" placeholder="Prénom (facultatif)"><button type="button" class="btn small" data-act="saveChild">Enregistrer</button></div>
         <p class="hint">Affiché seulement quand l'application est déverrouillée. Enregistré chiffré dans ce téléphone, jamais dans le code public. L'écran de verrouillage et l'icône affichent « ${NEUTRAL_TITLE} ».</p></section>
@@ -540,14 +678,14 @@
         <p class="hint">La restauration ajoute les observations manquantes et garde la version la plus récente de chacune ; rien n'est effacé.</p></section>
       <section class="card"><h3 class="card-title">Corbeille (${trash.length})</h3>
         ${trash.length ? `<div class="list">${trash.map((e) => `<div class="ev"><span class="bar ${e.intensity ? 'c-' + e.intensity : ''}"></span><span class="body"><span class="meta"><span class="kind">${esc(evTitle(e))}</span><span>${fmtShort(e.date)}</span></span><span class="txt">${esc(evText(e))}</span>
-          <span class="row"><button type="button" class="btn small quiet" data-act="restore" data-id="${e.id}">Restaurer</button><button type="button" class="btn small danger-ghost" data-act="purge" data-id="${e.id}">Effacer</button></span></span></div>`).join('')}</div>` : '<p class="empty-note">La corbeille est vide.</p>'}
-        <p class="hint">Les éléments sont effacés définitivement après 30 jours.</p></section>
+          <span class="row"><button type="button" class="btn small quiet" data-act="restore" data-id="${e.id}">Restaurer</button>${e.localOnly || e.syncVersion == null ? `<button type="button" class="btn small danger-ghost" data-act="purge" data-id="${e.id}">Effacer</button>` : ''}</span></span></div>`).join('')}</div>` : '<p class="empty-note">La corbeille est vide.</p>'}
+        <p class="hint">Les éléments sont effacés définitivement après 30 jours, sur les deux téléphones. Avant, l'un ou l'autre parent peut les restaurer.</p></section>
       <section class="card"><h3 class="card-title">Essais</h3>
         <button type="button" class="btn quiet block" data-act="demo">Ajouter des données fictives</button>
         <p class="hint">Pour tester l'application. Ces exemples sont inventés et marqués « [Exemple] ».</p>
         <button type="button" class="btn danger-ghost block" data-act="wipe">Effacer toutes les données de ce téléphone</button></section>
       <section class="card"><h3 class="card-title">Confidentialité</h3>
-        <p class="hint">Phase 2 : tout reste dans ce téléphone, rien n'est envoyé sur Internet. Les observations sont chiffrées (AES-256) avec une clé que l'application peut utiliser mais pas lire. Limite : quelqu'un qui aurait votre téléphone déverrouillé et des outils techniques avancés pourrait contourner le code de l'app ; d'où l'importance du verrouillage d'écran Android. Aucun diagnostic n'est établi par cette application.</p>
+        <p class="hint">Dans ce téléphone, les observations et la connexion sont chiffrées (AES-256) avec une clé que l'application peut utiliser mais pas lire. Une fois connecté, elles sont aussi envoyées en HTTPS à votre espace Supabase privé, lisible seulement par les comptes de Papa et Maman. Les données fictives (« [Exemple] ») restent dans ce téléphone. Limite : quelqu'un qui aurait votre téléphone déverrouillé et des outils techniques avancés pourrait contourner le code de l'app ; d'où l'importance du verrouillage d'écran Android. Aucun diagnostic n'est établi par cette application.</p>
         <p class="hint">Version ${APP_VERSION}</p></section>`;
     $('#importFile').addEventListener('change', importFile);
   }
@@ -606,19 +744,22 @@
     const days = (data.days || []).filter(validDay);
     const toWrite = [];
     let added = 0, updated = 0;
+    // Ce qui est restauré est renvoyé au serveur ; une différence avec la version partagée devient un conflit à trancher.
+    const mark = (o, cur) => { o.conflict = null; o.syncError = null; o.syncVersion = cur ? cur.syncVersion : o.syncVersion; o.rev = ((cur && cur.rev) || 0) + 1; o.dirty = !o.localOnly; if (cur && cur.comments && o.kind === 'event') { const ids = new Set((o.comments || []).map((c) => c.id)); o.comments = [...(o.comments || []), ...cur.comments.filter((c) => !ids.has(c.id))]; } };
     for (const e of evs) {
       const cur = S.events.get(e.id);
-      if (!cur) { added++; S.events.set(e.id, e); toWrite.push(e); }
-      else if ((e.updatedAt || '') > (cur.updatedAt || '')) { updated++; S.events.set(e.id, e); toWrite.push(e); }
+      if (!cur) { added++; mark(e, null); S.events.set(e.id, e); toWrite.push(e); }
+      else if ((e.updatedAt || '') > (cur.updatedAt || '')) { updated++; mark(e, cur); S.events.set(e.id, e); toWrite.push(e); }
     }
     for (const d of days) {
       const cur = S.days.get(d.date);
-      if (!cur || (d.updatedAt || '') > (cur.updatedAt || '')) { if (cur) d.id = cur.id; S.days.set(d.date, d); toWrite.push(d); if (cur) updated++; else added++; }
+      if (!cur || (d.updatedAt || '') > (cur.updatedAt || '')) { if (cur) d.id = cur.id; mark(d, cur); S.days.set(d.date, d); toWrite.push(d); if (cur) updated++; else added++; }
     }
     const sealed = [];
     for (const o of toWrite) sealed.push(await seal(o));
     await recPut(sealed);
     render();
+    scheduleSync();
     await ask({ title: 'Restauration terminée', text: `${added} élément(s) ajouté(s), ${updated} mis à jour. Rien n'a été effacé.`, ok: 'OK', cancel: null });
   }
 
@@ -628,7 +769,7 @@
     const mk = (daysAgo, time, type, intensity, note, extra = {}) => {
       const d = new Date(base); d.setDate(d.getDate() - daysAgo);
       if (d.getFullYear() < MIN_YEAR) return;
-      out.push({ id: uid(), kind: 'event', date: ymd(d), time, type, intensity, note: '[Exemple] ' + note, author: daysAgo % 2 ? 'Papa' : 'Maman', createdAt: nowIso(), comments: [], ...extra });
+      out.push({ id: uid(), kind: 'event', date: ymd(d), time, type, intensity, note: '[Exemple] ' + note, author: daysAgo % 2 ? 'Papa' : 'Maman', createdAt: nowIso(), comments: [], localOnly: true, ...extra });
     };
     mk(0, '16:05', 'crise', 'orange', 'Refus de quitter le parc, cris environ 10 minutes.', { place: 'Parc', duration: '10', intervention: 'Laisser de l\'espace, puis accompagner' });
     mk(0, '18:30', 'reussite', null, 'A dit « je suis fâché » au lieu de lancer son jouet.');
@@ -637,7 +778,7 @@
     mk(3, '15:30', 'beau_moment', null, 'A partagé ses blocs avec son cousin.');
     mk(4, '19:20', 'difficulte', null, 'Pleurs au coucher (intensité à préciser).');
     const daysOut = [];
-    const setDay = (daysAgo, rating, belle = false) => { const d = new Date(base); d.setDate(d.getDate() - daysAgo); if (d.getFullYear() < MIN_YEAR) return; const day = getDay(ymd(d)); day.rating = rating; day.belle = belle; day.updatedAt = nowIso(); day.version = (day.version || 0) + 1; S.days.set(day.date, day); daysOut.push(day); };
+    const setDay = (daysAgo, rating, belle = false) => { const d = new Date(base); d.setDate(d.getDate() - daysAgo); if (d.getFullYear() < MIN_YEAR) return; const day = getDay(ymd(d)); if (day.syncVersion != null || day.dirty) return; day.localOnly = true; day.rating = rating; day.belle = belle; day.updatedAt = nowIso(); day.version = (day.version || 0) + 1; S.days.set(day.date, day); daysOut.push(day); };
     setDay(1, 'jaune'); setDay(2, 'rouge'); setDay(3, 'vert', true); setDay(5, 'vert', true); setDay(6, 'jaune');
     out.forEach((e) => { e.updatedAt = e.createdAt; e.version = 1; S.events.set(e.id, e); });
     const sealed = [];
@@ -645,6 +786,101 @@
     await recPut(sealed);
     S.view = 'calendar'; S.selected = today(); S.month = null; render(); window.scrollTo(0, 0);
     toast('Données fictives ajoutées');
+  }
+
+  // ---------- Connexion ----------
+  function openLogin({ first = false } = {}) {
+    return new Promise((resolve) => {
+      const root = $('#modal-root');
+      root.innerHTML = `<div class="modal-wrap" role="dialog" aria-modal="true" aria-labelledby="lTitle"><div class="modal">
+        <h2 id="lTitle">Se connecter</h2>
+        <p>Utilisez votre compte du journal (le même sur vos deux téléphones). Vous ne le ferez qu'une fois sur ce téléphone.</p>
+        <label class="field"><span class="lbl">Courriel</span><input class="input" id="lEmail" type="email" autocomplete="username" inputmode="email" autocapitalize="off" spellcheck="false"></label>
+        <label class="field"><span class="lbl">Mot de passe</span><input class="input" id="lPw" type="password" autocomplete="current-password"></label>
+        <p class="small" id="lErr" role="alert" hidden></p>
+        <div class="actions"><button type="button" class="btn quiet small" id="lLater">${first ? 'Plus tard' : 'Annuler'}</button><button type="button" class="btn small" id="lGo">Se connecter</button></div>
+      </div></div>`;
+      const err = (t) => { const e = $('#lErr'); e.textContent = t; e.hidden = !t; };
+      setTimeout(() => $('#lEmail').focus(), 50);
+      const done = async (ok) => {
+        root.innerHTML = '';
+        if (!ok) { if (first) { S.settings.loginLater = true; await saveSettings(); if (!S.settings.parent) askParent(); } render(); return resolve(false); }
+        resolve(true);
+      };
+      $('#lLater').onclick = () => done(false);
+      const go = async () => {
+        const email = $('#lEmail').value.trim(); const pw = $('#lPw').value;
+        if (!email || !pw) { err('Entrez votre courriel et votre mot de passe.'); return; }
+        const btn = $('#lGo'); btn.disabled = true; btn.textContent = 'Connexion…'; err('');
+        try {
+          if (!client) setupSync();
+          S.session = await client.signIn(email, pw);
+        } catch (e) {
+          btn.disabled = false; btn.textContent = 'Se connecter';
+          err(e.kind === 'offline' ? 'Pas de connexion Internet. Réessayez quand le réseau revient.' : e.message || 'Connexion impossible.');
+          return;
+        }
+        $('#lPw').value = '';
+        S.loggedIn = true; S.settings.loginLater = false; await saveSettings();
+        root.innerHTML = '';
+        await afterLogin();
+        resolve(true);
+      };
+      $('#lGo').onclick = go;
+      $$('.input', root).forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); }));
+    });
+  }
+  async function afterLogin() {
+    const local = neverShared();
+    if (local.length) {
+      const nEv = local.filter((r) => r.kind === 'event').length; const nDay = local.length - nEv;
+      const parts = [nEv ? `${nEv} observation(s)` : '', nDay ? `${nDay} journée(s) notée(s)` : ''].filter(Boolean).join(' et ');
+      const ok = await ask({ title: 'Partager ce qui est déjà dans ce téléphone ?', text: `${parts} de ce téléphone n'ont jamais été partagées. Voulez-vous les ajouter au journal commun, visible par les deux parents ? Les données fictives « [Exemple] » ne sont jamais envoyées.`, ok: 'Partager', cancel: 'Garder ici seulement' });
+      if (!ok) { for (const r of local) { r.localOnly = true; r.dirty = false; await saveRecord(r); } }
+    }
+    startSyncLoop();
+    render();
+    await runSync({ manual: true });
+    render();
+  }
+
+  // ---------- Conflits ----------
+  function conflictRows(c) {
+    const theirs = c.o.conflict.row;
+    const mine = c.kind === 'event' ? JS.eventToRow(c.o) : JS.dayToRow(c.o);
+    const cols = JS.diffCols(mine, theirs, c.kind === 'event' ? JS.EVENT_COLS : JS.DAY_COLS);
+    const show = (col, v) => { const t = JS.describe(col, v); return col === 'type' && TYPES[v] ? TYPES[v] : (col === 'intensity' || col === 'rating') && COLOR_LABEL[v] ? COLOR_LABEL[v] : t; };
+    return cols.map((col) => `<tr><th scope="row">${esc(JS.FIELD_LABELS[col] || col)}</th><td>${esc(show(col, mine[col]))}</td><td>${esc(show(col, theirs[col]))}</td></tr>`).join('');
+  }
+  function openConflicts() {
+    const list = conflicts();
+    const root = $('#sheet-root');
+    if (!list.length) { closeSheets(); render(); toast('Aucun conflit à résoudre'); return; }
+    const names = (S.syncState && S.syncState.names) || {};
+    root.innerHTML = `<div class="panel" role="dialog" aria-modal="true" aria-labelledby="cTitle"><div class="panel-inner">
+      <div class="panel-head"><button type="button" class="icon-btn plain" data-cact="close" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="cTitle">Choisir la version à garder</span></div>
+      <p class="hint pad-hint">Ces fiches ont été modifiées sur les deux téléphones en même temps. Choisissez la version à garder : l'autre sera ajoutée en commentaire, rien n'est perdu.</p>
+      ${list.map((c) => {
+        const other = names[c.o.conflict.row.updated_by] || 'l\'autre parent';
+        const title = c.kind === 'event' ? `${esc(evTitle(c.o))} · ${fmtLong(c.o.date)}` : `Journée du ${fmtLong(c.o.date)}`;
+        return `<section class="card"><strong>${title}</strong>
+          <div class="cmp-wrap"><table class="cmp"><thead><tr><th></th><th>Ce téléphone</th><th>${esc(other)}</th></tr></thead><tbody>${conflictRows(c) || '<tr><td colspan="3">Aucune différence visible.</td></tr>'}</tbody></table></div>
+          <div class="row"><button type="button" class="btn small quiet" data-cact="mine" data-k="${c.kind}" data-id="${esc(c.id)}">Garder ce téléphone</button><button type="button" class="btn small" data-cact="theirs" data-k="${c.kind}" data-id="${esc(c.id)}">Garder ${esc(other)}</button></div></section>`;
+      }).join('')}
+    </div></div>`;
+    $('.panel', root).addEventListener('click', async (ev) => {
+      const b = ev.target.closest('[data-cact]');
+      if (!b) return;
+      if (b.dataset.cact === 'close') { closeSheets(); render(); return; }
+      b.disabled = true;
+      if (!engine) setupSync();
+      if (b.dataset.k === 'event') await engine.resolveEvent(b.dataset.id, b.dataset.cact);
+      else await engine.resolveDay(b.dataset.id, b.dataset.cact);
+      renderNeeded = false;
+      toast('Version choisie');
+      scheduleSync(300);
+      openConflicts();
+    });
   }
 
   // ---------- Actions ----------
@@ -689,10 +925,22 @@
       }
       case 'demo': await addDemo(); break;
       case 'wipe': {
-        const v = await ask({ title: 'Effacer toutes les données ?', text: 'Toutes les observations, le code et la clé de chiffrement de <strong>ce téléphone</strong> seront supprimés. Faites d\'abord une sauvegarde si nécessaire.', ok: 'Effacer', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+        const n = pendingCount();
+        const v = await ask({ title: 'Effacer toutes les données ?', text: `Toutes les observations, le code et la clé de chiffrement de <strong>ce téléphone</strong> seront supprimés.${n ? ` <strong>Attention : ${n} élément(s) n'ont pas encore été envoyés et seraient perdus.</strong> Synchronisez ou faites une sauvegarde d'abord.` : S.loggedIn ? ' Ce qui est déjà synchronisé reste sur le serveur et reviendra à la prochaine connexion.' : ' Faites d\'abord une sauvegarde si nécessaire.'}`, ok: 'Effacer', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
         if (!v) return;
-        await wipeAll(); location.reload(); break;
+        stopSync(); await wipeAll(); location.reload(); break;
       }
+      case 'login': await openLogin(); break;
+      case 'logout': {
+        const n = pendingCount();
+        const ok = await ask({ title: 'Se déconnecter ?', text: n ? `${n} élément(s) ne sont pas encore envoyés. Ils restent dans ce téléphone et partiront à la prochaine connexion.` : 'Les observations restent dans ce téléphone. La synchronisation s\'arrête jusqu\'à la prochaine connexion.', ok: 'Se déconnecter' });
+        if (!ok) return;
+        try { await client.signOut(); } catch (e) { /* rien */ }
+        S.loggedIn = false; S.session = null; S.settings.loginLater = true; await saveSettings(); S.sync = { status: 'idle', msg: '' };
+        render(); toast('Déconnecté'); break;
+      }
+      case 'syncNow': await runSync({ manual: true }); render(); break;
+      case 'conflicts': openConflicts(); break;
       default: break;
     }
   }
@@ -715,7 +963,8 @@
   setInterval(() => { if (S.unlocked && Date.now() - lastActivity >= LOCK_MS) lock(); }, 10000);
 
   function lock() {
-    S.unlocked = false;
+    stopSync();
+    S.unlocked = false; S.loggedIn = false; S.session = null; S.sync = { status: 'idle', msg: '' };
     DEK = null;
     S.events.clear(); S.days.clear(); S.settings = null;
     closeSheets(); $('#modal-root').innerHTML = ''; $('#toast').hidden = true;
@@ -731,8 +980,13 @@
     $('#lock').hidden = true; $('#lock').innerHTML = '';
     $('#shell').hidden = false;
     S.view = 'calendar'; S.selected = today(); S.month = null;
+    setupSync();
+    try { S.session = await client.getSession(); } catch (e) { S.session = null; }
+    S.loggedIn = !!S.session;
     render();
-    if (!S.settings.parent) askParent(); else if (S.settings.childName === undefined) askChild();
+    if (S.loggedIn) { startSyncLoop(); runSync(); if (S.settings.childName === undefined) askChild(); }
+    else if (!S.settings.loginLater) openLogin({ first: true }).then((ok) => { if (ok && S.settings.childName === undefined) askChild(); });
+    else if (!S.settings.parent) askParent(); else if (S.settings.childName === undefined) askChild();
   }
   async function askParent() {
     const root = $('#modal-root');
@@ -792,7 +1046,7 @@
       },
     });
     $('#forgot').onclick = async () => {
-      const v = await ask({ title: 'Code oublié', text: 'Pour l\'instant (phase 2), le seul moyen est d\'effacer les données de ce téléphone puis de restaurer une sauvegarde. Dès la phase 3, vous pourrez simplement vous reconnecter avec votre mot de passe et retrouver toutes les observations synchronisées.', ok: 'Effacer ce téléphone', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
+      const v = await ask({ title: 'Code oublié', text: 'Le code protège les données de ce téléphone : sans lui, il faut les effacer. Vous pourrez ensuite vous reconnecter avec votre compte et retrouver tout ce qui a déjà été synchronisé. <strong>Ce qui n\'avait pas encore été envoyé (par exemple noté hors ligne) serait perdu</strong> ; essayez d\'abord de vous souvenir du code.', ok: 'Effacer ce téléphone', danger: true, input: { label: 'Tapez EFFACER pour confirmer', validate: (x) => (x.trim().toUpperCase() === 'EFFACER' ? null : 'Tapez EFFACER.') } });
       if (v) { await wipeAll(); location.reload(); }
     };
   }

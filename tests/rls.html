@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://uqvpzuyficmbgovpnkuz.supabase.co; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Tests de sécurité</title>
+<style>
+  :root { --bg: #F6F7FB; --surface: #fff; --ink: #23263A; --muted: #5F6478; --line: #E6E8F0; --ok: #1E6B43; --okbg: #DDF3E6; --ko: #8E2A22; --kobg: #F9D3CF; --accent: #4B5BD7; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 16px; }
+  section { background: var(--surface); border-radius: 16px; padding: 16px; margin: 0 0 14px; box-shadow: 0 2px 10px rgba(35,38,58,.05); }
+  h2 { font-size: 17px; margin: 0 0 6px; }
+  p.hint { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin: 8px 0 4px; }
+  input { width: 100%; min-height: 44px; border: 1px solid #D9DCE6; border-radius: 12px; padding: 10px 12px; font-size: 16px; background: var(--bg); }
+  button { margin-top: 12px; min-height: 44px; padding: 0 18px; border: 0; border-radius: 14px; background: var(--accent); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  ol { margin: 12px 0 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+  li { padding: 8px 10px; border-radius: 10px; font-size: 14px; display: flex; gap: 10px; }
+  li.ok { background: var(--okbg); color: var(--ok); }
+  li.ko { background: var(--kobg); color: var(--ko); }
+  li b { flex: 0 0 64px; }
+  .sum { font-weight: 700; margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tests de sécurité du journal</h1>
+  <p class="lead">Ces tests vérifient sur le vrai serveur que les règles d'accès bloquent les inconnus et laissent passer les parents. Ils n'utilisent que des données fictives, marquées « [TEST RLS] » et datées du 31 décembre 2099. Le mot de passe sert seulement à ces tests ; il n'est enregistré nulle part.</p>
+  <p class="lead" id="target"></p>
+
+  <section>
+    <h2>1. Visiteur sans compte</h2>
+    <p class="hint">Ce qu'un inconnu peut faire avec l'adresse et la clé publique : rien.</p>
+    <button type="button" id="runAnon">Lancer</button>
+    <ol id="outAnon"></ol>
+  </section>
+
+  <section>
+    <h2>2. Parent connecté</h2>
+    <p class="hint">Avec votre compte : lire et écrire doit marcher, mais sans pouvoir tricher (se faire passer pour l'autre parent, modifier la liste des parents, effacer avant 30 jours…).</p>
+    <label for="pEmail">Courriel</label><input id="pEmail" type="email" autocomplete="username" autocapitalize="off" spellcheck="false">
+    <label for="pPw">Mot de passe</label><input id="pPw" type="password" autocomplete="current-password">
+    <button type="button" id="runParent">Lancer</button>
+    <ol id="outParent"></ol>
+  </section>
+
+  <section>
+    <h2>3. Compte qui n'est pas un parent (facultatif)</h2>
+    <p class="hint">Avec un compte de test créé dans Supabase, mais absent de la liste des parents : il ne doit rien voir ni rien écrire.</p>
+    <label for="iEmail">Courriel du compte de test</label><input id="iEmail" type="email" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label for="iPw">Mot de passe du compte de test</label><input id="iPw" type="password" autocomplete="off">
+    <button type="button" id="runIntrus">Lancer</button>
+    <ol id="outIntrus"></ol>
+  </section>
+</main>
+<script src="../js/config.js"></script>
+<script src="rls.js"></script>
+</body>
+</html>
