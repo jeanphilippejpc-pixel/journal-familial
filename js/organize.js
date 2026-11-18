@@ -253,7 +253,7 @@
     return lost;
   }
 
-  const api = { VERSION: '0.4.0', organize, build, splitSentences, tidy, classify, suggestCategories, questionsFor, findFlags, inventedWords, droppedWords, SECTIONS, SECTION_KEYS, SECTION_LABEL, CATEGORIES, CATEGORY_KEYS, CATEGORY_LABEL };
+  const api = { VERSION: '0.4.1', organize, build, splitSentences, tidy, classify, suggestCategories, questionsFor, findFlags, inventedWords, droppedWords, SECTIONS, SECTION_KEYS, SECTION_LABEL, CATEGORIES, CATEGORY_KEYS, CATEGORY_LABEL };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.JFOrganize = api;
 })(typeof window !== 'undefined' ? window : globalThis);

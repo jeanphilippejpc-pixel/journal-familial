@@ -19,6 +19,9 @@
   p.hint { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
   label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin: 8px 0 4px; }
   input { width: 100%; min-height: 44px; border: 1px solid #D9DCE6; border-radius: 12px; padding: 10px 12px; font-size: 16px; background: var(--bg); }
+  input[type=radio] { width: auto; min-height: 0; margin-right: 6px; }
+  fieldset { border: 1px solid #D9DCE6; border-radius: 12px; margin: 12px 0 0; padding: 6px 12px 10px; }
+  legend { font-size: 13px; font-weight: 600; color: var(--muted); }
   button { margin-top: 12px; min-height: 44px; padding: 0 18px; border: 0; border-radius: 14px; background: var(--accent); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   ol { margin: 12px 0 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
@@ -47,6 +50,11 @@
     <p class="hint">Avec votre compte : lire et écrire doit marcher, mais sans pouvoir tricher (se faire passer pour l'autre parent, modifier la liste des parents, effacer avant 30 jours…).</p>
     <label for="pEmail">Courriel</label><input id="pEmail" type="email" autocomplete="username" autocapitalize="off" spellcheck="false">
     <label for="pPw">Mot de passe</label><input id="pPw" type="password" autocomplete="current-password">
+    <fieldset>
+      <legend>Mode de vérification des versions attendu (script 05)</legend>
+      <label><input type="radio" name="mode" id="modeSouple" checked> Souple (après le script 05)</label>
+      <label><input type="radio" name="mode" id="modeStrict"> Obligatoire (seulement après le script 05b)</label>
+    </fieldset>
     <button type="button" id="runParent">Lancer</button>
     <ol id="outParent"></ol>
   </section>

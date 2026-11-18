@@ -1,7 +1,7 @@
 /* Service worker : met l'application en cache pour l'utiliser hors ligne.
  * Ne met en cache que les fichiers de l'application, jamais des données
  * (les observations restent dans IndexedDB, que ce fichier ne touche jamais). */
-const CACHE = 'jm-app-v0.4.0';
+const CACHE = 'jm-app-v0.4.1';
 const ASSETS = ['./', './index.html', './css/app.css', './js/config.js', './js/sync.js', './js/organize.js', './js/app.js', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png'];
 // À l'installation, on télécharge chaque fichier du réseau (« reload ») et non du cache HTTP
 // du navigateur : le nouveau cache ne peut pas contenir un ancien fichier.

@@ -1,6 +1,7 @@
 // Serveur local de test : sert l'application + un faux Supabase sous /mock (données fictives).
 // Lancer : node tests/serve.mjs   puis ouvrir http://localhost:8766/index.html?mock
 // Pour simuler une coupure réseau : http://localhost:8766/__mock/offline?on=1 (et on=0 pour rétablir)
+// Pour le mode obligatoire du script 05 (faux serveur) : http://localhost:8766/__mock/strict?on=1
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -15,6 +16,7 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; ch
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  if (url.pathname === '/__mock/strict') { mock.opt.strict = url.searchParams.get('on') === '1'; res.end(`strict=${mock.opt.strict}`); return; } // mode obligatoire du script 05 (faux serveur)
   if (url.pathname === '/__mock/offline') { offline = url.searchParams.get('on') === '1'; res.end(`offline=${offline}`); return; }
   if (url.pathname.startsWith('/mock/')) {
     if (offline) { req.socket.destroy(); return; }

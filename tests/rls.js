@@ -6,8 +6,8 @@
   const $ = (s) => document.querySelector(s);
   $('#target').textContent = mock ? 'Cible : faux serveur local (essai).' : 'Cible : votre projet Supabase « Journal-Familial ».';
 
-  async function call(method, path, { token, body, prefer = true } = {}) {
-    const headers = { apikey: key, Authorization: `Bearer ${token || key}`, 'Content-Type': 'application/json' };
+  async function call(method, path, { token, body, prefer = true, extra = {} } = {}) {
+    const headers = { apikey: key, Authorization: `Bearer ${token || key}`, 'Content-Type': 'application/json', ...extra };
     if (prefer && method !== 'GET') headers.Prefer = 'return=representation';
     let res;
     try { res = await fetch(url + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store' }); }
@@ -39,6 +39,12 @@
   const denied = (r) => !r.ok && r.status >= 400 && r.status < 500;
   const show = (r) => `HTTP ${r.status}${r.data && r.data.message ? ' ' + r.data.message : ''}`;
   const uuid = () => crypto.randomUUID();
+  // Script 05 : chaque modification indique la version sur laquelle elle s'appuie (comme l'app 0.4.1)
+  async function versionOf(path, token) {
+    const r = await call('GET', path.replace(/&version=eq.d+/, '') + '&select=version', { token });
+    return r.ok && r.data && r.data[0] ? r.data[0].version : null;
+  }
+  async function patchB(path, token, body) { return call('PATCH', path, { token, body: { ...body, base_version: await versionOf(path, token) } }); }
 
   function button(id, fn) {
     const b = $(id);
@@ -90,16 +96,16 @@
       t.add('Ajouter une observation : accepté', !!row, show(ins));
       t.add('Auteur imposé par le serveur (impossible de signer au nom de l\'autre parent)', row && row.author_id === me, row ? 'auteur = ' + row.author_id : '');
       t.add('Version et date de création imposées par le serveur', row && row.version === 1 && Date.parse(row.created_at) > Date.parse('2026-01-01'), row ? `version ${row.version}, créée ${row.created_at}` : '');
-      const bad = await call('PATCH', `/rest/v1/events?id=eq.${id}&version=eq.99`, { token, body: { note: '[TEST RLS] mauvaise version' } });
+      const bad = await patchB(`/rest/v1/events?id=eq.${id}&version=eq.99`, token, { note: '[TEST RLS] mauvaise version' });
       t.add('Modification avec une version périmée : ignorée (détection des conflits)', bad.ok && bad.data.length === 0, show(bad));
-      const upd = await call('PATCH', `/rest/v1/events?id=eq.${id}&version=eq.1`, { token, body: { note: '[TEST RLS] modifiée', author_id: other } });
+      const upd = await patchB(`/rest/v1/events?id=eq.${id}&version=eq.1`, token, { note: '[TEST RLS] modifiée', author_id: other });
       const u = upd.ok ? upd.data[0] : null;
       t.add('Modification avec la bonne version : acceptée, version 2', u && u.version === 2 && u.note === '[TEST RLS] modifiée', show(upd));
       t.add('L\'auteur ne peut pas être changé', u && u.author_id === me && u.updated_by === me);
       const del = await call('DELETE', `/rest/v1/events?id=eq.${id}`, { token });
       const still = await call('GET', `/rest/v1/events?id=eq.${id}&select=id`, { token });
       t.add('Effacement définitif immédiat : refusé', (denied(del) || (del.ok && del.data.length === 0)) && still.ok && still.data.length === 1, show(del));
-      const trash = await call('PATCH', `/rest/v1/events?id=eq.${id}`, { token, body: { deleted_at: '2020-01-01T00:00:00Z' } });
+      const trash = await patchB(`/rest/v1/events?id=eq.${id}`, token, { deleted_at: '2020-01-01T00:00:00Z' });
       const tr = trash.ok ? trash.data[0] : null;
       t.add('Mise à la corbeille : la date est fixée par le serveur (impossible d\'antidater)', tr && Date.parse(tr.deleted_at) > Date.now() - 864e5, tr ? 'corbeille = ' + tr.deleted_at : show(trash));
       const del2 = await call('DELETE', `/rest/v1/events?id=eq.${id}`, { token });
@@ -115,27 +121,57 @@
       const sIns = await call('POST', '/rest/v1/events', { token, body: { id: sid, date: TEST_DATE, type: 'autre', note: '[TEST RLS] structurée', original_text: '[TEST RLS] texte original', context: '[TEST RLS] contexte', categories: ['emotions'], approved_at: '2020-01-01T00:00:00Z', approved_by: other } });
       const sr = sIns.ok ? sIns.data[0] : null;
       t.add('Phase 4 : nouvelle fiche enregistrée non approuvée (approved_at / approved_by envoyés ignorés)', sr && sr.approved_at === null && sr.approved_by === null, show(sIns));
-      const sAppr = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: sr ? sr.version : 1 } });
+      const sAppr = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { approval_version: sr ? sr.version : 1 });
       const sa = sAppr.ok ? sAppr.data[0] : null;
       t.add('Phase 4 : approbation séparée → date fixée par le serveur, au nom du parent connecté, version +1', sa && sa.approved_by === me && Date.parse(sa.approved_at) > Date.parse('2026-01-01') && sa.version === sr.version + 1, sa ? `approuvée par ${sa.approved_by}, version ${sa.version}` : show(sAppr));
-      const sMix = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { note: '[TEST RLS] modifiée en approuvant', approval_version: sa ? sa.version : 2 } });
+      const sMix = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { note: '[TEST RLS] modifiée en approuvant', approval_version: sa ? sa.version : 2 });
       t.add('Phase 4 : approbation + modification dans la même requête → refusée', denied(sMix), show(sMix));
-      await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { note: '[TEST RLS] version B' } }); // modification B enregistrée
+      await patchB(`/rest/v1/events?id=eq.${sid}`, token, { note: '[TEST RLS] version B' }); // modification B enregistrée
       const sB = await call('GET', `/rest/v1/events?id=eq.${sid}&select=version`, { token });
       const vB = sB.ok ? sB.data[0].version : null;
-      const sApprB = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: vB } });
+      const sApprB = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { approval_version: vB });
       t.add('Phase 4 : version B approuvée séparément', sApprB.ok && sApprB.data[0].approved_by === me, show(sApprB));
-      const sLate = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { approval_version: sr ? sr.version : 1 } });
+      const sLate = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { approval_version: sr ? sr.version : 1 });
       const sNow = await call('GET', `/rest/v1/events?id=eq.${sid}&select=note,version`, { token });
       t.add('Phase 4 : ancienne demande arrivée en retard → refusée, la version récente reste intacte', denied(sLate) && sNow.ok && sNow.data[0].note === '[TEST RLS] version B' && sNow.data[0].version === vB + 1, show(sLate));
-      const sOrig = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { original_text: '[TEST RLS] retouché' } });
+      const sOrig = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { original_text: '[TEST RLS] retouché' });
       t.add('Phase 4 : texte original impossible à modifier', denied(sOrig), show(sOrig));
-      const sEdit = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { context: '[TEST RLS] contexte modifié', approved_by: other } });
+      const sEdit = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { context: '[TEST RLS] contexte modifié', approved_by: other });
       const se = sEdit.ok ? sEdit.data[0] : null;
       t.add('Phase 4 : section modifiée sans nouvelle approbation → approbation retirée', se && se.approved_at === null && se.approved_by === null, se ? `approved_at = ${se.approved_at}` : show(sEdit));
-      const sCat = await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { categories: ['piratage'] } });
+      const sCat = await patchB(`/rest/v1/events?id=eq.${sid}`, token, { categories: ['piratage'] });
       t.add('Phase 4 : catégorie inconnue refusée', denied(sCat), show(sCat));
-      await call('PATCH', `/rest/v1/events?id=eq.${sid}`, { token, body: { deleted_at: new Date().toISOString() } }); // à la corbeille (nettoyée par le script 03)
+      await patchB(`/rest/v1/events?id=eq.${sid}`, token, { deleted_at: new Date().toISOString() }); // à la corbeille (nettoyée par le script 03)
+
+      // Script 05 : vérification des versions par le serveur
+      const strict = $('#modeStrict').checked;
+      const vid = uuid();
+      const vIns = await call('POST', '/rest/v1/events', { token, body: { id: vid, date: TEST_DATE, type: 'autre', note: '[TEST RLS] versions' } });
+      const v1 = vIns.ok ? vIns.data[0].version : 1;
+      const vOk = await call('PATCH', `/rest/v1/events?id=eq.${vid}&version=eq.${v1}`, { token, body: { note: '[TEST RLS] versions B', base_version: v1 } });
+      const vo = vOk.ok ? vOk.data[0] : null;
+      t.add('Script 05 : modification avec la bonne version de départ → acceptée, version +1, base_version non conservée', vo && vo.version === v1 + 1 && vo.base_version === null, show(vOk));
+      const vStale = await call('PATCH', `/rest/v1/events?id=eq.${vid}`, { token, body: { note: '[TEST RLS] écrase ?', base_version: v1 } });
+      const vNow = await call('GET', `/rest/v1/events?id=eq.${vid}&select=note`, { token });
+      t.add('Script 05 : version de départ périmée → refusée (JFV02), rien n\'est écrasé', denied(vStale) && vStale.data && vStale.data.code === 'JFV02' && vNow.ok && vNow.data[0].note === '[TEST RLS] versions B', show(vStale));
+      const vNone = await call('PATCH', `/rest/v1/events?id=eq.${vid}`, { token, body: { note: '[TEST RLS] sans version' } });
+      if (strict) t.add('Script 05 (mode OBLIGATOIRE attendu) : modification sans version de départ → refusée (JFV01)', denied(vNone) && vNone.data && vNone.data.code === 'JFV01', show(vNone));
+      else t.add('Script 05 (mode souple attendu) : modification sans version de départ (app 0.4.0) → acceptée', vNone.ok && vNone.data.length === 1, show(vNone));
+      const vv = await versionOf(`/rest/v1/events?id=eq.${vid}`, token);
+      const vAppr = await call('PATCH', `/rest/v1/events?id=eq.${vid}&version=eq.${vv}`, { token, body: { approval_version: vv, base_version: vv } });
+      t.add('Script 05 : approbation avec la version de départ → acceptée, au nom du parent connecté', vAppr.ok && vAppr.data.length === 1 && vAppr.data[0].approved_by === me, show(vAppr));
+      await patchB(`/rest/v1/events?id=eq.${vid}`, token, { deleted_at: new Date().toISOString() });
+
+      // Script 05 : le schéma privé (mode, registre, fonction) n'est pas accessible par l'API
+      for (const [label, method, path, extra] of [
+        ['lire le mode', 'GET', '/rest/v1/reglages?select=*', { 'Accept-Profile': 'private' }],
+        ['lire le registre', 'GET', '/rest/v1/journal_versions?select=*', { 'Accept-Profile': 'private' }],
+        ['changer le mode', 'PATCH', '/rest/v1/reglages?cle=eq.version_obligatoire', { 'Content-Profile': 'private' }],
+        ['appeler la fonction de vérification', 'POST', '/rest/v1/rpc/verifier_version', { 'Content-Profile': 'private' }],
+      ]) {
+        const pr = await call(method, path, { token, extra, body: method === 'GET' ? undefined : (method === 'PATCH' ? { valeur: false } : {}) });
+        t.add(`Script 05 : impossible de ${label} par l'API (schéma privé non exposé)`, denied(pr), show(pr));
+      }
 
       // Commentaires : ajoutés, jamais modifiés ni effacés
       const cid = uuid();
@@ -148,8 +184,12 @@
 
       // Journées
       let d = await call('POST', '/rest/v1/days', { token, body: { date: TEST_DATE, rating: 'vert', belle: true } });
-      if (d.status === 409) d = await call('PATCH', `/rest/v1/days?date=eq.${TEST_DATE}`, { token, body: { rating: 'vert', belle: true } });
+      if (d.status === 409) d = await patchB(`/rest/v1/days?date=eq.${TEST_DATE}`, token, { rating: 'vert', belle: true });
       t.add('Noter une journée : accepté', d.ok && d.data.length === 1 && d.data[0].updated_by === me, show(d));
+      const dv = await versionOf(`/rest/v1/days?date=eq.${TEST_DATE}`, token);
+      const dStale = await call('PATCH', `/rest/v1/days?date=eq.${TEST_DATE}`, { token, body: { rating: 'rouge', base_version: dv ? dv - 1 || 99 : 99 } });
+      const dNow = await call('GET', `/rest/v1/days?date=eq.${TEST_DATE}&select=rating`, { token });
+      t.add('Script 05 : journée avec une version de départ périmée → refusée (JFV02)', denied(dStale) && dNow.ok && dNow.data[0].rating === 'vert', show(dStale));
       const dd = await call('DELETE', `/rest/v1/days?date=eq.${TEST_DATE}`, { token });
       const dg = await call('GET', `/rest/v1/days?date=eq.${TEST_DATE}&select=date`, { token });
       t.add('Effacer une journée : refusé', (denied(dd) || (dd.ok && !dd.data.length)) && dg.ok && dg.data.length === 1, show(dd));

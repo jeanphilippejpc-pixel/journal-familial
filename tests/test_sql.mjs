@@ -103,6 +103,10 @@ const v = (await db.query(`select (select count(*) from information_schema.colum
 check('Vérification finale : 7 colonnes, 1 déclencheur, 10 règles RLS, RLS actif sur les 4 tables', v.c === 7 && v.t === 1 && v.p === 10 && v.rls === 4, JSON.stringify(v));
 let again = true; try { await db.exec(await sql('04-observations-structurees.sql')); } catch (e) { again = e.message; }
 check('Le script 04 peut être relancé sans risque', again === true && (await snap()) === before, String(again));
+// Avec WITH05=1 : toute la suite du script 04 est rejouée APRÈS l'installation du script 05 (mode souple),
+// pour vérifier que les nouveaux déclencheurs ne changent rien aux règles d'approbation et de version.
+const WITH05 = !!process.env.WITH05;
+if (WITH05) { let m5 = true; try { await db.exec(await sql('05-verification-des-versions.sql')); } catch (e) { m5 = e.message; } check('[avec le script 05] Le script 05 s\'exécute sans erreur', m5 === true && (await snap()) === before, String(m5)); }
 
 // --- Approbation contrôlée par le serveur ---
 const N = 'bbbbbbbb-0000-4000-8000-000000000001';
@@ -121,7 +125,7 @@ check('… puis approbation séparée, après relecture : acceptée (heure du se
 check('Une approbation réussie augmente la version une seule fois (1 → 2)', row && row.version === 2, JSON.stringify(row));
 // Point 2 : ordre des déclencheurs
 const trg = (await db.query(`select tgname from pg_trigger where tgrelid = 'public.events'::regclass and not tgisinternal order by tgname`)).rows.map((x) => x.tgname);
-check('Ordre des déclencheurs (alphabétique, règle PostgreSQL) : events_approval puis events_stamp', JSON.stringify(trg) === JSON.stringify(['events_approval', 'events_stamp']), trg.join(', '));
+check('Ordre des déclencheurs (alphabétique, règle PostgreSQL) : events_approval puis events_stamp', JSON.stringify(trg) === JSON.stringify(WITH05 ? ['events_approval', 'events_base', 'events_stamp'] : ['events_approval', 'events_stamp']), trg.join(', '));
 r = await as(PAPA, `update public.events set approved_by = $2 where id = $1 returning approved_by, approved_at`, [N, MAMAN]);
 check('Impossible de changer l\'auteur de l\'approbation', r.ok && r.rows[0].approved_by === PAPA && r.rows[0].approved_at !== null, r.error || JSON.stringify(r.rows));
 r = await as(PAPA, `update public.events set approved_at = '2030-01-01' where id = $1 returning approved_at`, [N]);

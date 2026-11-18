@@ -2,8 +2,11 @@
 // et les déclencheurs de version de la vraie base. Données fictives uniquement.
 import { randomUUID } from 'node:crypto';
 
-export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
-  const opt = { schema }; // 3 = base avant le script 04 (pour tester l'ordre migration → publication)
+export function createMock({ now = () => Date.now(), schema = 5, strict = false } = {}) {
+  // schema : 3 = avant le script 04, 4 = avant le script 05, 5 = script 05 installé.
+  // strict : mode obligatoire du script 05 (activé à la main par le script 05b).
+  const opt = { schema, strict };
+  const journal = []; // registre de suivi du script 05 : { table, uid, avec }
   const NEW_COLS = ['outcome', 'impressions', 'original_text', 'categories', 'approval_version', 'approved_at', 'approved_by'];
   const users = {
     'papa@test.local': { id: '11111111-1111-4111-8111-111111111111', password: 'motdepasse-test', name: 'Papa', parent: true },
@@ -47,7 +50,7 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
     });
   }
   const KEY = { events: 'id', days: 'date', comments: 'id' };
-  const ALLOWED = { events: ['id', 'date', 'time', 'type', 'intensity', 'note', 'duration_min', 'place', 'people', 'state_before', 'context', 'description', 'adult_reaction', 'intervention', 'child_reaction', 'calm_time_min', 'helped', 'extra', 'marked_complete', 'deleted_at', 'author_id', 'version', 'created_at', 'updated_at', 'updated_by', 'outcome', 'impressions', 'original_text', 'categories', 'approval_version', 'approved_at', 'approved_by'], days: ['date', 'rating', 'belle', 'version', 'created_at', 'updated_at', 'updated_by'], comments: ['id', 'event_id', 'text', 'author_id', 'created_at'] };
+  const ALLOWED = { events: ['id', 'date', 'time', 'type', 'intensity', 'note', 'duration_min', 'place', 'people', 'state_before', 'context', 'description', 'adult_reaction', 'intervention', 'child_reaction', 'calm_time_min', 'helped', 'extra', 'marked_complete', 'deleted_at', 'author_id', 'version', 'created_at', 'updated_at', 'updated_by', 'outcome', 'impressions', 'original_text', 'categories', 'approval_version', 'approved_at', 'approved_by', 'base_version'], days: ['date', 'rating', 'belle', 'version', 'created_at', 'updated_at', 'updated_by', 'base_version'], comments: ['id', 'event_id', 'text', 'author_id', 'created_at'] };
   function check(table, r) {
     if (table === 'events') {
       if (!r.type && !r.intensity && !(r.note && r.note !== '')) return 'check';
@@ -95,6 +98,8 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
     const uid = tok && tok.exp > now() ? tok.uid : null;
     if (path === '/auth/v1/logout') { tokens.delete(auth); return json(204, null); }
     // ----- REST -----
+    const profile = headers['accept-profile'] || headers['content-profile'];
+    if (profile && profile !== 'public') return err(406, 'PGRST106', 'The schema must be one of the following: public, graphql_public');
     const m = path.match(/^\/rest\/v1\/(\w+)$/);
     if (!m) return err(404, 'PGRST', 'not found');
     const table = m[1];
@@ -105,8 +110,12 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
       return json(200, parent ? parents.map((p) => ({ ...p })) : []);
     }
     if (!T[table]) return err(404, 'PGRST205', 'table not found');
-    if (table === 'events' && opt.schema < 4 && body && (method === 'POST' || method === 'PATCH')) { const k = NEW_COLS.find((c) => body[c] !== undefined); if (k) return err(400, 'PGRST204', `Could not find the '${k}' column of 'events' in the schema cache`); }
-    const strip = (r) => { if (table !== 'events' || opt.schema >= 4) return { ...r }; const c = { ...r }; NEW_COLS.forEach((k) => delete c[k]); return c; };
+    if (body && (method === 'POST' || method === 'PATCH') && (table === 'events' || table === 'days')) {
+      const missing = (k) => (k === 'base_version' && opt.schema < 5) || (table === 'events' && opt.schema < 4 && NEW_COLS.includes(k));
+      const k = Object.keys(body).find((c) => body[c] !== undefined && missing(c));
+      if (k) return err(400, 'PGRST204', `Could not find the '${k}' column of '${table}' in the schema cache`);
+    }
+    const strip = (r) => { const c = { ...r }; if (opt.schema < 5) delete c.base_version; if (table === 'events' && opt.schema < 4) NEW_COLS.forEach((k) => delete c[k]); return c; };
     const filters = parseFilters(u.searchParams);
     const rows = () => [...T[table].values()].filter((r) => parent && match(r, filters));
     if (method === 'GET') {
@@ -132,6 +141,7 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
       if (table !== 'days') r.author_id = uid;
       if (table === 'events') { r.marked_complete = !!r.marked_complete; if (r.deleted_at) r.deleted_at = t; if (r.categories == null) r.categories = []; if (blank(r.original_text)) r.original_text = null; if (r.approval_version != null) return err(400, 'P0001', 'Approbation refusée : une nouvelle fiche doit d\'abord être enregistrée, puis approuvée séparément.'); r.approved_at = null; r.approved_by = null; }
       if (table === 'days') r.belle = !!r.belle;
+      if (table !== 'comments') r.base_version = null;
       if (check(table, r)) return err(400, '23514', 'new row violates check constraint');
       T[table].set(key, r);
       return json(201, [strip(r)]);
@@ -158,6 +168,13 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
           else { n.approval_version = old.approval_version; n.approved_at = old.approved_at; n.approved_by = old.approved_by; if (contenuModifie) { n.approved_at = null; n.approved_by = null; } }
         }
         if (table === 'days') n.date = old.date;
+        // imite private.verifier_version (script 05)
+        if (opt.schema >= 5) {
+          if (n.base_version != null && n.base_version !== old.version) return err(400, 'JFV02', `La fiche a changé depuis votre dernière synchronisation (version ${n.base_version}, version actuelle ${old.version}). Rien n'a été écrit.`);
+          if (n.base_version == null && opt.strict) return err(400, 'JFV01', "Mise à jour de l'application nécessaire : fermez puis rouvrez le Journal. Vos changements restent dans le téléphone.");
+          journal.push({ table, uid, avec: n.base_version != null });
+          n.base_version = null;
+        }
         if (check(table, n)) return err(400, '23514', 'violates check constraint');
         out.push(n);
       }
@@ -184,5 +201,5 @@ export function createMock({ now = () => Date.now(), schema = 4 } = {}) {
     const text = r.body == null ? '' : JSON.stringify(r.body);
     return { ok: r.status >= 200 && r.status < 300, status: r.status, text: async () => text };
   }
-  return { handle, fetchFn, net, opt, tables: T, users, stats, expireTokens: () => { for (const t of tokens.values()) t.exp = 0; } };
+  return { handle, fetchFn, net, opt, journal, tables: T, users, stats, expireTokens: () => { for (const t of tokens.values()) t.exp = 0; } };
 }

@@ -167,6 +167,30 @@
     let running = null;
     let again = false;
 
+    // -- Version de départ (script SQL 05) --
+    // Chaque modification envoie base_version = la version sur laquelle elle s'appuie, en plus du
+    // filtre « version=eq.N » de l'adresse. Le serveur refuse une base périmée (code JFV02).
+    // SEUL cas où l'on renvoie sans base_version : le serveur répond que la colonne n'existe pas
+    // encore (script 05 pas installé, erreur PGRST204 qui nomme « base_version »). Dans ce cas le
+    // serveur n'a pas non plus la vérification : rien n'est contourné. Un refus de version (JFV01,
+    // JFV02), un conflit ou toute autre erreur n'est JAMAIS renvoyé sans base_version.
+    const baseMissing = {}; // table -> true quand la colonne est absente (revérifié à chaque synchronisation)
+    const noBaseColumn = (res) => res.status === 400 && res.data && res.data.code === 'PGRST204'
+      && /'base_version'/.test(String(res.data.message || ''));
+    async function patchWithBase(table, path, body, baseVersion) {
+      if (!baseMissing[table]) {
+        const res = await client.request('PATCH', path, { ...body, base_version: baseVersion }, REP);
+        if (!noBaseColumn(res)) return res;
+        baseMissing[table] = true;
+      }
+      return client.request('PATCH', path, body, REP);
+    }
+    const isStale = (res) => res.status === 400 && res.data && res.data.code === 'JFV02';
+    const needsUpdate = (res) => res.status === 400 && res.data && res.data.code === 'JFV01';
+    // Réponse « rien n'a été écrit parce que la fiche a changé » : 0 ligne (filtre d'adresse) ou refus JFV02
+    const unchangedBecauseNewer = (res) => (res.ok && Array.isArray(res.data) && res.data.length === 0) || isStale(res);
+    let updateRequired = false;
+
     function isOld(iso, days) { return iso && Date.parse(iso) < store.now() - days * 864e5; }
     async function fetchOne(table, col, val) {
       const res = await client.request('GET', `/rest/v1/${table}?${col}=eq.${enc(val)}&select=*`);
@@ -201,15 +225,15 @@
           if (srv) { await markEventConflict(e, srv); return null; }
         }
       } else {
-        res = await client.request('PATCH', `/rest/v1/events?id=eq.${enc(e.id)}&version=eq.${e.syncVersion}`, row, REP);
-        if (res.ok && Array.isArray(res.data) && res.data.length === 0) {
+        res = await patchWithBase('events', `/rest/v1/events?id=eq.${enc(e.id)}&version=eq.${e.syncVersion}`, row, e.syncVersion);
+        if (unchangedBecauseNewer(res)) {
           const srv = await fetchOne('events', 'id', e.id);
           if (!srv) { e.syncVersion = null; await store.putEvent(e); return pushContent(e); } // effacé ailleurs : on le renvoie plutôt que de le perdre
           if (sameEvent(e, srv)) return srv;
           await markEventConflict(e, srv); return null;
         }
       }
-      if (!res.ok) { e.syncError = httpMessage(res); await store.putEvent(e); return null; }
+      if (!res.ok) { if (needsUpdate(res)) updateRequired = true; e.syncError = httpMessage(res); await store.putEvent(e); return null; }
       return res.data[0];
     }
     async function pushEvent(e) {
@@ -223,15 +247,16 @@
       const s = await client.getSession();
       if (srv.approved_at && s && s.user && srv.approved_by === s.user.id) return adoptEvent(e, srv, rev);
       // Étape 2 : l'approbation, SEULE, sur la version exacte qui vient d'être enregistrée (script SQL 04 v5)
-      const res = await client.request('PATCH', `/rest/v1/events?id=eq.${enc(e.id)}&version=eq.${srv.version}`, { approval_version: srv.version }, REP);
+      const res = await patchWithBase('events', `/rest/v1/events?id=eq.${enc(e.id)}&version=eq.${srv.version}`, { approval_version: srv.version }, srv.version);
       if (res.ok && Array.isArray(res.data) && res.data.length) return adoptEvent(e, res.data[0], rev);
       e.syncVersion = srv.version;
-      if (res.ok) { // la fiche a changé sur l'autre téléphone entre les deux étapes
+      if (unchangedBecauseNewer(res)) { // la fiche a changé sur l'autre téléphone entre les deux étapes
         const cur = await fetchOne('events', 'id', e.id);
         if (cur && sameEvent(e, cur)) { e.syncVersion = cur.version; await store.putEvent(e); again = true; return; } // même contenu : nouvel essai
         if (cur) return markEventConflict(e, cur);
         return store.putEvent(e);
       }
+      if (needsUpdate(res)) updateRequired = true;
       e.syncError = httpMessage(res); await store.putEvent(e); // la demande reste, rien n'est perdu
     }
 
@@ -253,15 +278,15 @@
           if (srv) return markDayConflict(d, srv);
         }
       } else {
-        res = await client.request('PATCH', `/rest/v1/days?date=eq.${enc(d.date)}&version=eq.${d.syncVersion}`, row, REP);
-        if (res.ok && Array.isArray(res.data) && res.data.length === 0) {
+        res = await patchWithBase('days', `/rest/v1/days?date=eq.${enc(d.date)}&version=eq.${d.syncVersion}`, row, d.syncVersion);
+        if (unchangedBecauseNewer(res)) {
           const srv = await fetchOne('days', 'date', d.date);
           if (!srv) { d.syncVersion = null; await store.putDay(d); return pushDay(d); }
           if (sameDay(d, srv)) return adoptDay(d, srv, rev);
           return markDayConflict(d, srv);
         }
       }
-      if (!res.ok) { d.syncError = httpMessage(res); await store.putDay(d); return; }
+      if (!res.ok) { if (needsUpdate(res)) updateRequired = true; d.syncError = httpMessage(res); await store.putDay(d); return; }
       return adoptDay(d, res.data[0], rev);
     }
 
@@ -362,6 +387,8 @@
       running = (async () => {
         try {
           let rounds = 0;
+          for (const k of Object.keys(baseMissing)) delete baseMissing[k]; // le script 05 a pu être installé depuis
+          updateRequired = false;
           do { again = false; await pushAll(); await pullAll(); rounds++; } while (again && rounds < 3);
           await purgeOld(trashDays);
         } finally { running = null; }
@@ -407,10 +434,10 @@
       else { const n = rowToDay(theirs, store.names, d); n.rev = (d.rev || 0) + 1; await store.putDay(n); }
     }
 
-    return { sync, resolveEvent, resolveDay, isRunning: () => !!running };
+    return { sync, resolveEvent, resolveDay, isRunning: () => !!running, needsUpdate: () => updateRequired };
   }
 
-  const api = { VERSION: '0.4.0', createClient, createEngine, eventToRow, rowToEvent, dayToRow, rowToDay, sameEvent, sameDay, summarize, diffCols, isPending, usesStructure, SyncError, EVENT_COLS, ALL_EVENT_COLS, STRUCT_COLS, CATEGORY_ORDER, DAY_COLS, FIELD_LABELS, describe };
+  const api = { VERSION: '0.4.1', createClient, createEngine, eventToRow, rowToEvent, dayToRow, rowToDay, sameEvent, sameDay, summarize, diffCols, isPending, usesStructure, SyncError, EVENT_COLS, ALL_EVENT_COLS, STRUCT_COLS, CATEGORY_ORDER, DAY_COLS, FIELD_LABELS, describe };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.JFSync = api;
 })(typeof window !== 'undefined' ? window : globalThis);

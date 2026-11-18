@@ -7,7 +7,7 @@
   'use strict';
 
   // ---------- Constantes ----------
-  const APP_VERSION = '0.4.0';
+  const APP_VERSION = '0.4.1';
   const CFG = window.JF_CONFIG;
   const JS = window.JFSync;
   const OR = window.JFOrganize;
@@ -420,7 +420,8 @@
     let out = '';
     if (c) out += `<div class="banner warn"><span class="spacer">${c === 1 ? 'Une fiche a été modifiée' : `${c} fiches ont été modifiées`} sur les deux téléphones en même temps. Choisissez la version à garder.</span><button type="button" class="btn small quiet" data-act="conflicts">Voir</button></div>`;
     if (!S.loggedIn && !S.settings.loginLater) out += `<div class="banner"><span class="spacer">${S.sync.status === 'auth' ? 'Reconnectez-vous pour reprendre la synchronisation. Vos observations restent dans ce téléphone.' : 'Connectez-vous pour partager le journal entre vos deux téléphones.'}</span><button type="button" class="btn small quiet" data-act="login">Se connecter</button></div>`;
-    else if (S.loggedIn && syncErrors().length) out += `<div class="banner warn"><span class="spacer">Certaines observations n'ont pas pu être envoyées. Elles sont gardées dans ce téléphone.</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Détails</button></div>`;
+    else if (S.loggedIn && engine && engine.needsUpdate()) out += `<div class="banner warn"><span class="spacer">Une version plus récente du journal est nécessaire pour envoyer vos modifications. Elles sont gardées dans ce téléphone.</span><button type="button" class="btn small quiet" data-act="reload">Recharger</button></div>`;
+    else if (S.loggedIn && syncErrors().length) out +=`<div class="banner warn"><span class="spacer">Certaines observations n'ont pas pu être envoyées. Elles sont gardées dans ce téléphone.</span><button type="button" class="btn small quiet" data-act="nav" data-view="settings">Détails</button></div>`;
     return out;
   }
   function draftBanner() {
@@ -1123,6 +1124,7 @@
     switch (act) {
       case 'nav': closeSheets(); S.view = el.dataset.view; render(); view().focus(); window.scrollTo(0, 0); break;
       case 'quick': openQuick(el.dataset.date); break;
+      case 'reload': await flushDraft(); location.reload(); break;
       case 'closeSheet': if (ev && el.classList.contains('overlay') && ev.target !== el) return; closeSheets(); break;
       case 'dictate': { const n = $('#qNote'); n.focus(); n.setSelectionRange(n.value.length, n.value.length); break; }
       case 'month': {

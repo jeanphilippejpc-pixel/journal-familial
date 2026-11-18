@@ -50,7 +50,10 @@ Les scripts SQL du dossier `supabase/` créent les tables et les règles d'accè
 node tests/test_sync.mjs        # synchronisation, hors ligne, conflits (faux serveur, données fictives)
 node tests/test_organize.mjs    # organisation locale des récits (récits fictifs ; aucun mot ajouté ni perdu)
 node tests/test_compat.mjs      # compatibilité 0.3.0 ↔ 0.4.0 et ordre « script 04 → publication »
-PGLITE=<dossier> node tests/test_sql.mjs  # scripts SQL 01, 02, 04 sur PostgreSQL local (PGlite), sans Supabase
+PGLITE=<dossier> node tests/test_sql.mjs  # scripts SQL 01, 02, 04 sur PostgreSQL local (PGlite), sans Supabase (WITH05=1 : rejoué avec le script 05 installé)
+node tests/test_versions.mjs    # vérification des versions (script 05) : concurrence hors ligne, 0.3.0/0.4.0/0.4.1, modes souple et obligatoire
+PGLITE=<dossier> node tests/test_sql05.mjs  # script SQL 05 (et 05a, 05b, 05c) sur PostgreSQL local (PGlite)
+PGLITE=<dossier> node tests/test_postgrest05.mjs  # script 05 face aux requêtes PATCH/POST telles que PostgREST les exécute (corps 0.4.0 et 0.4.1)
 node tests/serve.mjs            # app de test : http://localhost:8766/index.html?mock
                                 # tests de sécurité réels : http://localhost:8766/tests/rls.html
 python3 tests/test_phase2.py    # fonctions locales (Python, Playwright et Chrome)
