@@ -226,3 +226,73 @@ details > summary { cursor: pointer; padding: 4px 0; }
 .chip-tag.soft { background: var(--bg); color: var(--muted); font-weight: 600; }
 .ev .tags { gap: 4px; margin-top: 4px; }
 .ev .tags .chip-tag { font-size: 11px; padding: 2px 8px; }
+
+/* ---------- Phase 5 : filtres, statistiques, rapports ---------- */
+.filters { display: flex; flex-direction: column; gap: 8px; }
+.pill.small-pill { min-height: 40px; padding: 0 12px; font-size: 13px; }
+.pad-row { margin: 10px 16px 0; display: flex; flex-direction: column; gap: 8px; }
+.row.pad-row { flex-direction: row; align-items: center; }
+.seg.grow { flex: 1; }
+.sel-count { margin: 0; font-size: 15px; }
+.panel-inner.wide { max-width: 900px; }
+.paper { margin: 10px 12px 0; padding: 18px 16px; background: #fff; border-radius: 12px; box-shadow: var(--shadow); overflow-x: auto; }
+#print-root { display: none; }
+
+/* Le rapport (aperçu et impression) */
+.rpt { color: #23263A; font-size: 12.5px; line-height: 1.4; }
+.rpt h1 { margin: 0 0 4px; font-size: 19px; font-weight: 800; }
+.rpt h2 { margin: 12px 0 5px; font-size: 13.5px; font-weight: 800; color: #2B3590; border-bottom: 1px solid #D9DCE6; padding-bottom: 2px; }
+.rpt h3 { margin: 0 0 4px; font-size: 12.5px; font-weight: 700; }
+.rpt p { margin: 0 0 4px; }
+.rpt-head p { color: #5F6478; font-size: 11.5px; }
+.rpt-scope { margin-top: 6px !important; padding: 6px 8px; background: #F3F4F9; border-radius: 6px; font-size: 11.5px; }
+.rpt-muted { color: #6A6F82; font-weight: 400; }
+.rpt-small { font-size: 11px; color: #5F6478; }
+.rpt-sub { margin-top: 6px !important; font-weight: 700; }
+.rpt-note { font-size: 10.5px; color: #5F6478; font-style: italic; }
+.rpt-foot { margin-top: 10px !important; padding-top: 6px; border-top: 1px solid #D9DCE6; font-size: 10px; color: #5F6478; }
+.rpt-t { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.rpt-t th, .rpt-t td { text-align: left; padding: 3px 5px; border-bottom: 1px solid #E6E8F0; vertical-align: top; }
+.rpt-t td { white-space: nowrap; }
+.rpt-t thead th { font-size: 10.5px; color: #5F6478; }
+.rpt-t .rpt-sum th, .rpt-t .rpt-sum td { font-weight: 700; border-bottom: 0; }
+.rpt-trend th, .rpt-trend td { font-size: 10.5px; padding: 2px 4px; }
+.rpt-list { margin: 2px 0 0; padding-left: 16px; font-size: 11.5px; }
+.rpt-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.rpt-chart { width: 100%; height: auto; display: block; }
+.rpt-ob { padding: 6px 0; border-bottom: 1px solid #E6E8F0; }
+.rpt-ob dl { margin: 2px 0; display: grid; grid-template-columns: 150px 1fr; gap: 1px 10px; }
+.rpt-ob dt { font-weight: 700; color: #5F6478; font-size: 11px; }
+.rpt-ob dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.rpt-status { font-size: 10.5px; color: #5F6478; }
+.rpt-unapproved { background: #FFF6E5; padding-left: 6px; border-left: 3px solid #C9A227; }
+.rpt-unapproved .rpt-status { color: #8A4310; font-weight: 700; }
+.rpt-imp, .rpt-orig { margin-top: 10px; }
+.rpt-imp > h2 { color: #8A4310; }
+.rpt-original { white-space: pre-wrap; font-size: 11.5px; }
+@media (max-width: 520px) {
+  .rpt-cols { grid-template-columns: 1fr; }
+  .rpt-t td { white-space: normal; }
+  .seg button { padding: 0 8px; white-space: nowrap; font-size: 13px; }
+  .rpt-trend { font-size: 10px; }
+  .paper { padding: 14px 10px; }
+  .rpt-ob dl { grid-template-columns: 1fr; }
+}
+
+/* Impression : seul le rapport est imprimé (tout le reste de l'app est masqué) */
+@media print {
+  @page { margin: 11mm 12mm; }
+  html, body { background: #fff !important; }
+  body > *:not(#print-root) { display: none !important; }
+  #print-root { display: block !important; }
+  .rpt { font-size: 10.5px; }
+  .rpt h1 { font-size: 17px; }
+  .rpt h2 { font-size: 12px; margin-top: 9px; }
+  .rpt-t, .rpt-list { font-size: 10px; }
+  .rpt-cols { grid-template-columns: 1fr 1fr; }
+  .rpt-ob dl { grid-template-columns: 140px 1fr; }
+  .rpt-page { break-after: page; }
+  .rpt-imp, .rpt-orig { break-before: page; } /* impressions et annexe : toujours sur une nouvelle page */
+  .rpt-ob, .rpt-t tr, .rpt-chart { break-inside: avoid; }
+  .rpt h2 { break-after: avoid; }
+}

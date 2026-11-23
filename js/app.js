@@ -7,10 +7,12 @@
   'use strict';
 
   // ---------- Constantes ----------
-  const APP_VERSION = '0.4.1';
+  const APP_VERSION = '0.5.0';
   const CFG = window.JF_CONFIG;
   const JS = window.JFSync;
   const OR = window.JFOrganize;
+  const ST = window.JFStats;
+  const RP = window.JFReport;
   const STRUCT_FIELDS = ['context', 'description', 'childReaction', 'intervention', 'outcome', 'impressions'];
   const SYNC_EVERY_MS = 60 * 1000;
   const DB_NAME = 'journal-familial';
@@ -164,6 +166,10 @@
     selected: today(),
     jFilter: 'tous',
     jQuery: '',
+    // Phase 5 : filtres du Journal, statistiques, rapports (en mémoire seulement, jamais enregistrés)
+    jf: null, jfOpen: false,
+    evo: { range: '4w', unit: 'week' },
+    rep: null,
     syncState: null, // curseurs, noms des parents, dernière synchro (chiffré)
     sync: { status: 'idle', msg: '' }, // idle | running | ok | offline | error | auth | denied | none
     loggedIn: false,
@@ -382,6 +388,8 @@
     if (d) flushDraft(); // écrit immédiatement, pendant que la clé est disponible
     liveDraft = null;
     $('#sheet-root').innerHTML = '';
+    clearReport(); // un rapport prévisualisé n'est gardé nulle part
+    if (S.unlocked) applyTitles(true);
     if (kept) { S.drafts.set(d.id, d); if (S.unlocked) render(); toast('Brouillon gardé', { label: 'Reprendre', run: () => resumeDraft(d.id) }); }
   }
   function resumeDraft(id) { const d = S.drafts.get(id); if (!d) { toast('Ce brouillon n\'existe plus.'); return; } if (d.step === 'review') openReview(id); else openQuick(null, d); }
@@ -403,7 +411,14 @@
     if (S.view === 'calendar') renderCalendar();
     else if (S.view === 'journal') renderJournal();
     else if (S.view === 'settings') renderSettings();
-    else renderPlaceholder();
+    else if (S.view === 'evolution') renderEvolution();
+    else if (S.view === 'reports') renderReports();
+  }
+  // Filtres et options des rapports : remis à zéro à chaque déverrouillage (jamais enregistrés)
+  function resetPhase5() {
+    S.jf = ST.emptyFilter(); S.jfOpen = false; S.jQuery = '';
+    S.evo = { range: '4w', unit: 'week' };
+    S.rep = { kind: 'summary', preset: '4w', from: '', to: '', filter: ST.emptyFilter(), filtersOpen: false, includeUnapproved: false, impressions: false, original: false, hide: true };
   }
 
   // ---------- Calendrier ----------
@@ -821,19 +836,70 @@
     };
   }
 
+  // ---------- Filtres combinables (phase 5) : Journal et Rapports utilisent le même modèle ----------
+  const statsCtx = { isApproved, isIncomplete, categoryLabel: (k) => OR.CATEGORY_LABEL[k] || k };
+  const filterOf = (scope) => (scope === 'r' ? S.rep.filter : S.jf);
+  const knownPlaces = () => { const set = new Map(PLACES.map((p) => [ST.norm(p), p])); for (const e of liveEvents()) { const p = String(e.place || '').trim(); if (p && !set.has(ST.norm(p))) set.set(ST.norm(p), p); } return [...set.values()]; };
+  const knownAuthors = () => [...new Set(liveEvents().map((e) => e.author).filter(Boolean))].sort();
+  function pills(scope, key, options) {
+    const f = filterOf(scope);
+    return `<div class="row wrap">${options.map(([v, l]) => `<button type="button" class="pill small-pill" data-act="fl" data-scope="${scope}" data-k="${key}" data-v="${esc(v)}" aria-pressed="${(f[key] || []).includes(v)}">${esc(l)}</button>`).join('')}</div>`;
+  }
+  function filterPanel(scope) {
+    const f = filterOf(scope);
+    const authors = knownAuthors();
+    return `<div class="filters">
+      ${scope === 'j' ? `<div class="two"><label class="field"><span class="lbl">Du</span><input class="input" type="date" data-fdate="from" data-scope="j" value="${esc(f.from)}" min="${MIN_YEAR}-01-01"></label>
+        <label class="field"><span class="lbl">Au</span><input class="input" type="date" data-fdate="to" data-scope="j" value="${esc(f.to)}" min="${MIN_YEAR}-01-01"></label></div>` : `<label class="field"><span class="lbl">Mots dans les observations (facultatif)</span><input class="input" type="search" data-fq="r" value="${esc(f.q)}" placeholder="ex. : transition, école"></label>`}
+      <span class="lbl">Type</span>${pills(scope, 'types', Object.entries(TYPES))}
+      <span class="lbl">Intensité</span>${pills(scope, 'intensities', [...COLORS.map((c) => [c, `${COLOR_LABEL[c]} · ${COLOR_DESC[c].toLowerCase()}`]), ['none', 'Sans intensité']])}
+      <span class="lbl">Catégories</span>${pills(scope, 'categories', OR.CATEGORIES)}
+      <span class="lbl">Endroit</span>${pills(scope, 'places', knownPlaces().map((p) => [p, p]))}
+      ${authors.length > 1 ? `<span class="lbl">Noté par</span>${pills(scope, 'authors', authors.map((a) => [a, a]))}` : ''}
+      ${scope === 'j' ? `<span class="lbl">Approbation</span><div class="seg">${[['all', 'Toutes'], ['approved', 'Approuvées'], ['not_approved', 'Non approuvées']].map(([v, l]) => `<button type="button" data-act="flApproval" data-v="${v}" aria-pressed="${f.approval === v}">${l}</button>`).join('')}</div>
+        <label class="check"><input type="checkbox" data-ftodo="j" ${f.todo ? 'checked' : ''}> Seulement les fiches « À compléter »</label>` : ''}
+      <button type="button" class="btn quiet small" data-act="flReset" data-scope="${scope}">Effacer les filtres</button>
+    </div>`;
+  }
+  // Description lisible des critères (affichée dans le rapport)
+  function criteriaText(f) {
+    const out = [];
+    if ((f.types || []).length) out.push(`types : ${f.types.map((t) => TYPES[t] || t).join(', ')}`);
+    if ((f.intensities || []).length) out.push(`intensités : ${f.intensities.map((c) => (c === 'none' ? 'sans intensité' : COLOR_LABEL[c].toLowerCase())).join(', ')}`);
+    if ((f.categories || []).length) out.push(`catégories : ${f.categories.map((c) => OR.CATEGORY_LABEL[c] || c).join(', ')}`);
+    if ((f.places || []).length) out.push(`endroits : ${f.places.join(', ')}`);
+    if ((f.authors || []).length) out.push(`notées par : ${f.authors.join(', ')}`);
+    if ((f.q || '').trim()) out.push(`mots : « ${f.q.trim()} »`);
+    return out;
+  }
+  function attachFilterInputs() {
+    $$('[data-fdate]').forEach((inp) => inp.addEventListener('change', () => { filterOf(inp.dataset.scope)[inp.dataset.fdate] = inp.value; render(); }));
+    $$('[data-ftodo]').forEach((inp) => inp.addEventListener('change', () => { S.jf.todo = inp.checked; render(); }));
+    $$('[data-fq]').forEach((inp) => inp.addEventListener('change', () => { S.rep.filter.q = inp.value; render(); }));
+  }
+
   // ---------- Journal ----------
+  const QUICK = [['todo', 'À compléter'], ['hard', 'Difficultés et crises'], ['intense', 'Crises intenses'], ['pos', 'Réussites et beaux moments']];
+  const same = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
+  function quickOn(k) {
+    const f = S.jf;
+    if (k === 'todo') return f.todo;
+    if (k === 'hard') return same(f.types, HARD_TYPES);
+    if (k === 'intense') return same(f.intensities, ['rouge']);
+    if (k === 'pos') return same(f.types, ['reussite', 'beau_moment']);
+    return false;
+  }
   function renderJournal() {
-    const filters = [['tous', 'Tout'], ['todo', 'À compléter'], ['hard', 'Difficultés et crises'], ['intense', 'Crises intenses'], ['pos', 'Réussites et beaux moments']];
-    const q = S.jQuery.toLowerCase();
-    let list = liveEvents();
-    if (S.jFilter === 'todo') list = list.filter(isIncomplete);
-    if (S.jFilter === 'hard') list = list.filter((e) => HARD_TYPES.includes(e.type));
-    if (S.jFilter === 'intense') list = list.filter((e) => e.intensity === 'rouge');
-    if (S.jFilter === 'pos') list = list.filter(isPositive);
-    if (q) list = list.filter((e) => [e.note, e.place, e.people, e.context, e.description, e.intervention, e.helped, e.extra, e.childReaction, e.adultReaction, e.stateBefore, e.outcome, e.impressions, e.originalText, TYPES[e.type], ...(e.categories || []).map((c) => OR.CATEGORY_LABEL[c])].join(' ').toLowerCase().includes(q));
-    list.sort((a, b) => sortEv(b, a));
+    const f = S.jf;
+    f.q = S.jQuery;
+    const list = ST.filterEvents(liveEvents(), f, statsCtx).sort((a, b) => sortEv(b, a));
+    const nAct = ST.activeCount({ ...f, q: '' });
     let html = `<div class="search">${ico('search', 20)}<label class="sr" for="jq">Rechercher</label><input id="jq" type="search" placeholder="Rechercher (ex. : parc, transition, école)" value="${esc(S.jQuery)}"></div>
-      <div class="chips">${filters.map(([k, l]) => `<button type="button" class="pill" data-act="jf" data-f="${k}" aria-pressed="${S.jFilter === k}">${l}</button>`).join('')}</div>`;
+      <div class="chips">${QUICK.map(([k, l]) => `<button type="button" class="pill" data-act="quickF" data-f="${k}" aria-pressed="${quickOn(k)}">${l}</button>`).join('')}
+        <button type="button" class="pill" data-act="jfOpen" aria-expanded="${!!S.jfOpen}">Filtres${nAct ? ` (${nAct})` : ''} ${S.jfOpen ? '▴' : '▾'}</button></div>
+      ${S.jfOpen ? `<section class="card">${filterPanel('j')}</section>` : ''}
+      <div class="row wrap pad-row"><span class="hint spacer">${list.length} observation${list.length > 1 ? 's' : ''}${nAct || S.jQuery.trim() ? ' correspondent aux filtres' : ''}</span>
+        ${list.length ? '<button type="button" class="btn small quiet" data-act="jToReport">Créer un rapport avec ces filtres</button>' : ''}</div>`;
     if (!list.length) html += '<div class="placeholder">Aucun événement ne correspond.</div>';
     let cur = '';
     for (const e of list) {
@@ -842,18 +908,133 @@
       html += evRow(e, true, true);
     }
     if (cur) html += '</div>';
-    html += '<p class="hint pad-hint">La recherche et les filtres avancés (endroits, interventions, périodes) arrivent en phase 5.</p>';
     view().innerHTML = html;
+    attachFilterInputs();
     const inp = $('#jq');
     inp.addEventListener('input', () => { S.jQuery = inp.value; const pos = inp.selectionStart; renderJournal(); const n = $('#jq'); n.focus(); n.setSelectionRange(pos, pos); });
   }
 
-  function renderPlaceholder() {
-    const txt = S.view === 'evolution'
-      ? 'Les statistiques (journées par couleur, comparaisons hebdomadaires et mensuelles, temps moyen de retour au calme) arrivent en phase 5.'
-      : 'La création du rapport PDF pour les professionnels arrive en phase 5. Il sera produit dans le téléphone et rien ne sera envoyé automatiquement.';
-    view().innerHTML = `<div class="placeholder">${txt}</div>`;
+  // ---------- Périodes ----------
+  function presetRange(key) {
+    const to = today();
+    const minus = (months) => { const d = parseYmd(to); d.setMonth(d.getMonth() - months); d.setDate(d.getDate() + 1); return ymd(d); };
+    let from = to;
+    if (key === '4w') from = ST.addDays(to, -27);
+    else if (key === '3m') from = minus(3);
+    else if (key === '6m') from = minus(6);
+    else if (key === '12m') from = minus(12);
+    else if (key === 'all') { const dates = [...liveEvents().map((e) => e.date), ...[...S.days.values()].filter((d) => d.rating).map((d) => d.date)].sort(); from = dates[0] || ST.addDays(to, -27); }
+    if (from < `${MIN_YEAR}-01-01`) from = `${MIN_YEAR}-01-01`;
+    return { from, to };
   }
+  const getDayFn = (d) => S.days.get(d) || null;
+
+  // ---------- Évolution (statistiques) ----------
+  function renderEvolution() {
+    const ev = S.evo;
+    const { from, to } = presetRange(ev.range);
+    const events = ST.filterEvents(liveEvents(), { ...ST.emptyFilter(), from, to }, statsCtx);
+    const sum = ST.summarize(getDayFn, events, from, to);
+    const buckets = ev.unit === 'month' ? sum.months : sum.weeks;
+    const ranges = [['4w', '4 semaines'], ['3m', '3 mois'], ['12m', '12 mois'], ['all', 'Tout']];
+    view().innerHTML = `<div class="chips"><div class="seg grow">${ranges.map(([k, l]) => `<button type="button" data-act="evoRange" data-v="${k}" aria-pressed="${ev.range === k}">${l}</button>`).join('')}</div></div>
+      <section class="card stat-scope"><p class="hint"><strong>Basé sur ${sum.n} observation${sum.n > 1 ? 's' : ''}</strong> du ${ST.fmtDay(from)} au ${ST.fmtDay(to)} (${sum.days.total} jours)${sum.examples ? `, dont ${sum.examples} fiche${sum.examples > 1 ? 's' : ''} d'exemple` : ''}. Toutes les observations sont comptées, approuvées ou non.</p></section>
+      <section class="card"><h3 class="card-title">Journées</h3>${RP.daysTable(sum.days)}
+        <div class="seg">${[['week', 'Par semaine'], ['month', 'Par mois']].map(([k, l]) => `<button type="button" data-act="evoUnit" data-v="${k}" aria-pressed="${ev.unit === k}">${l}</button>`).join('')}</div>
+        ${RP.dayChart(buckets, 360)}
+        <p class="hint">Une journée non évaluée n'a pas reçu de couleur : elle n'est jamais comptée comme une journée sans difficulté.</p></section>
+      <section class="card"><h3 class="card-title">Tendances ${ev.unit === 'month' ? 'par mois' : 'par semaine'}</h3><div class="cmp-wrap">${RP.trendTable(buckets)}</div></section>
+      <section class="card"><h3 class="card-title">Observations</h3>
+        <p class="hint">Difficultés et crises : <strong>${sum.hard}</strong> (dont ${sum.intense} rouges) · Réussites et beaux moments : <strong>${sum.positive}</strong></p>
+        <p class="hint">Retour au calme : ${RP.esc(RP.calmText(sum.calm))}.</p></section>
+      <section class="card"><h3 class="card-title">Catégories les plus fréquentes</h3><p class="hint">Sur ${sum.categories.n} observations (${sum.categories.withCategory} avec au moins une catégorie).</p>${RP.freqList(sum.categories.items, sum.categories.n, (x) => OR.CATEGORY_LABEL[x.key] || x.key, 5)}</section>
+      <section class="card"><h3 class="card-title">Contextes des difficultés et crises</h3><p class="hint">Sur ${sum.contexts.n} difficultés et crises.</p>
+        <span class="lbl">Endroits (${sum.contexts.places.n} précisés)</span>${RP.freqList(sum.contexts.places.items, sum.contexts.n, (x) => x.key, 4)}
+        <span class="lbl">Moments de la journée (${sum.contexts.moments.n} avec l'heure)</span>${RP.freqList(sum.contexts.moments.items, sum.contexts.n, (x) => x.label, 5)}
+        <span class="lbl">Jours de la semaine</span>${RP.freqList(sum.contexts.weekdays.items, sum.contexts.n, (x) => x.key, 7)}</section>
+      <section class="card"><h3 class="card-title">Interventions et retour au calme</h3>${RP.interventionBlock(sum.interventions, 5)}</section>
+      <p class="hint pad-hint">Calculé dans ce téléphone, rien n'est envoyé. Les statistiques ne valent que pour les observations notées.</p>`;
+  }
+
+  // ---------- Rapports ----------
+  function reportSelection() {
+    const r = S.rep;
+    const { from, to } = r.preset === 'custom' ? { from: r.from, to: r.to } : presetRange(r.preset);
+    const f = { ...r.filter, from, to, approval: r.includeUnapproved ? 'all' : 'approved', examples: false };
+    const events = ST.filterEvents(liveEvents(), f, statsCtx);
+    const prevRange = ST.previousPeriod(from, to);
+    const prevEvents = ST.filterEvents(liveEvents(), { ...f, ...prevRange }, statsCtx);
+    const all = ST.filterEvents(liveEvents(), { ...f, approval: 'all' }, statsCtx);
+    return { from, to, f, events, prev: { ...prevRange, events: prevEvents }, notApprovedLeftOut: r.includeUnapproved ? 0 : all.length - events.length };
+  }
+  function renderReports() {
+    const r = S.rep;
+    const sel = reportSelection();
+    const nAct = ST.activeCount({ ...r.filter, approval: 'all', examples: true });
+    const presets = [['4w', '4 semaines'], ['3m', '3 mois'], ['6m', '6 mois'], ['custom', 'Autre']];
+    const okDates = sel.from && sel.to && sel.from <= sel.to;
+    view().innerHTML = `<section class="card"><h3 class="card-title">Type de rapport</h3>
+        <div class="seg">${[['summary', 'Résumé (1 page)'], ['detailed', 'Rapport détaillé']].map(([k, l]) => `<button type="button" data-act="repKind" data-v="${k}" aria-pressed="${r.kind === k}">${l}</button>`).join('')}</div>
+        <p class="hint">${r.kind === 'summary' ? 'Une page de synthèse : journées, observations, catégories, contextes et interventions. Aucune impression des parents.' : 'La page de synthèse, les tendances, puis chaque observation (faits observés), et en option les impressions des parents dans une section séparée.'}</p></section>
+      <section class="card"><h3 class="card-title">Période</h3>
+        <div class="seg">${presets.map(([k, l]) => `<button type="button" data-act="repPreset" data-v="${k}" aria-pressed="${r.preset === k}">${l}</button>`).join('')}</div>
+        ${r.preset === 'custom' ? `<div class="two"><label class="field"><span class="lbl">Du</span><input class="input" type="date" id="rFrom" value="${esc(r.from)}" min="${MIN_YEAR}-01-01" max="${today()}"></label><label class="field"><span class="lbl">Au</span><input class="input" type="date" id="rTo" value="${esc(r.to)}" min="${MIN_YEAR}-01-01" max="${today()}"></label></div>` : ''}
+        <p class="hint">${okDates ? `Du ${ST.fmtDay(sel.from)} au ${ST.fmtDay(sel.to)}.` : 'Choisissez une date de début et une date de fin.'}</p></section>
+      <section class="card"><h3 class="card-title">Observations incluses</h3>
+        <p class="sel-count"><strong>${sel.events.length}</strong> observation${sel.events.length > 1 ? 's' : ''} sélectionnée${sel.events.length > 1 ? 's' : ''}${sel.notApprovedLeftOut ? ` · ${sel.notApprovedLeftOut} non approuvée${sel.notApprovedLeftOut > 1 ? 's' : ''} laissée${sel.notApprovedLeftOut > 1 ? 's' : ''} de côté` : ''}</p>
+        <label class="check"><input type="checkbox" id="rUnapproved" ${r.includeUnapproved ? 'checked' : ''}> Inclure aussi les fiches non approuvées (elles seront marquées « non approuvée »)</label>
+        <div class="row wrap"><button type="button" class="pill" data-act="repFilters" aria-expanded="${!!r.filtersOpen}">Filtres${nAct ? ` (${nAct})` : ''} ${r.filtersOpen ? '▴' : '▾'}</button>
+          <button type="button" class="btn small quiet" data-act="repFromJournal">Reprendre les filtres du Journal</button></div>
+        ${r.filtersOpen ? filterPanel('r') : ''}
+        <p class="hint">Les fiches d'exemple et celles de la corbeille ne sont jamais incluses.</p></section>
+      <section class="card"><h3 class="card-title">Contenu et confidentialité</h3>
+        <label class="check"><input type="checkbox" id="rHide" ${r.hide ? 'checked' : ''}> Masquer les renseignements personnels (prénom de l'enfant, noms des parents, personnes présentes)</label>
+        <label class="check"><input type="checkbox" id="rImp" ${r.impressions ? 'checked' : ''} ${r.kind === 'summary' ? 'disabled' : ''}> Ajouter les impressions des parents (section séparée des faits)</label>
+        <label class="check"><input type="checkbox" id="rOrig" ${r.original ? 'checked' : ''} ${r.kind === 'summary' ? 'disabled' : ''}> Ajouter les textes originaux dictés (en annexe)</label>
+        ${r.hide ? '<p class="hint">Le masquage remplace le prénom enregistré dans les Paramètres. Relisez l\'aperçu : un autre nom écrit dans une observation n\'est pas détecté automatiquement.</p>' : ''}</section>
+      <div class="pad-row"><button type="button" class="btn block" data-act="repPreview" ${okDates ? '' : 'disabled'}>Prévisualiser le rapport</button>
+        <p class="hint">Le rapport est préparé dans ce téléphone. Il n'est ni envoyé, ni enregistré par l'application : c'est vous qui choisissez de l'imprimer ou de l'enregistrer en PDF.</p></div>`;
+    attachFilterInputs();
+    const bind = (id, fn) => { const el = $(id); if (el) el.addEventListener('change', () => { fn(el); render(); }); };
+    bind('#rFrom', (el) => { r.from = el.value; });
+    bind('#rTo', (el) => { r.to = el.value; });
+    bind('#rUnapproved', (el) => { r.includeUnapproved = el.checked; });
+    bind('#rHide', (el) => { r.hide = el.checked; });
+    bind('#rImp', (el) => { r.impressions = el.checked; });
+    bind('#rOrig', (el) => { r.original = el.checked; });
+  }
+  function approvalTextFor(e, hide) {
+    if (!isApproved(e)) return 'NON APPROUVÉE';
+    const d = e.approval.at ? new Date(e.approval.at) : null;
+    const when = d ? ` le ${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}` : '';
+    const who = hide ? '' : (parentName(e.approval.byId) || e.approval.by || '');
+    return `Approuvée${who ? ` par ${who}` : ''}${when}`;
+  }
+  // Aperçu : le rapport n'existe qu'en mémoire, dans la page ; il est effacé à la fermeture et au verrouillage
+  function clearReport() { const p = $('#print-root'); if (p) p.innerHTML = ''; }
+  function openReportPreview() {
+    const r = S.rep;
+    const sel = reportSelection();
+    const html = RP.build({
+      kind: r.kind, events: sel.events, getDay: getDayFn, from: sel.from, to: sel.to, prev: sel.prev,
+      includeImpressions: r.kind === 'detailed' && r.impressions, includeOriginal: r.kind === 'detailed' && r.original, hideIdentity: r.hide,
+      childName: childName(), isApproved, approvalText: approvalTextFor, generatedAt: nowIso(), criteria: criteriaText(r.filter), categoryLabel: (k) => OR.CATEGORY_LABEL[k] || k,
+    });
+    $('#print-root').innerHTML = html;
+    const root = $('#sheet-root');
+    root.innerHTML = `<div class="panel" role="dialog" aria-modal="true" aria-labelledby="pTitle"><div class="panel-inner wide">
+      <div class="panel-head"><button type="button" class="icon-btn plain" id="pBack" aria-label="Retour">${ico('left', 20)}</button><span class="title" id="pTitle">Aperçu du rapport</span><button type="button" class="btn small" id="pPrint">Imprimer ou PDF</button></div>
+      <div class="banner"><span class="spacer">Relisez avant d'imprimer. Pour un PDF : dans la fenêtre d'impression, choisissez « Enregistrer au format PDF » (Android) ou utilisez « Partager » puis « Enregistrer dans Fichiers » (iPhone). Rien n'est envoyé par l'application.</span></div>
+      <div class="paper">${html}</div></div></div>`;
+    $('#pBack').onclick = () => closeSheets();
+    $('#pPrint').onclick = () => printReport(sel);
+  }
+  function printReport(sel) {
+    // Nom proposé pour le PDF : sans prénom si les renseignements sont masqués
+    document.title = `Rapport d'observation ${sel.from} au ${sel.to}${!S.rep.hide && childName() ? ` - ${childName()}` : ''}`;
+    window.print();
+  }
+  window.addEventListener('afterprint', () => { if (S.unlocked) applyTitles(true); });
 
   // ---------- Paramètres ----------
   function renderSettings() {
@@ -1149,6 +1330,48 @@
       }
       case 'open': openDetail(el.dataset.id); break;
       case 'jf': S.jFilter = el.dataset.f; render(); break;
+      // Phase 5 : filtres combinables, statistiques, rapports
+      case 'fl': {
+        const f = filterOf(el.dataset.scope); const k = el.dataset.k; const v = el.dataset.v;
+        f[k] = (f[k] || []).includes(v) ? f[k].filter((x) => x !== v) : [...(f[k] || []), v];
+        render(); break;
+      }
+      case 'flApproval': S.jf.approval = el.dataset.v; render(); break;
+      case 'flReset': {
+        if (el.dataset.scope === 'r') S.rep.filter = ST.emptyFilter();
+        else { S.jf = ST.emptyFilter(); S.jQuery = ''; }
+        render(); break;
+      }
+      case 'jfOpen': S.jfOpen = !S.jfOpen; render(); break;
+      case 'quickF': {
+        const k = el.dataset.f; const on = quickOn(k);
+        if (k === 'todo') S.jf.todo = !on;
+        if (k === 'hard') S.jf.types = on ? [] : [...HARD_TYPES];
+        if (k === 'pos') S.jf.types = on ? [] : ['reussite', 'beau_moment'];
+        if (k === 'intense') S.jf.intensities = on ? [] : ['rouge'];
+        render(); break;
+      }
+      case 'jToReport': {
+        // Les filtres du Journal servent à choisir les observations du rapport (seulement les approuvées par défaut)
+        S.rep.filter = { ...ST.emptyFilter(), ...JSON.parse(JSON.stringify(S.jf)), q: S.jQuery, from: '', to: '', approval: 'all', todo: false };
+        if (S.jf.from || S.jf.to) { S.rep.preset = 'custom'; S.rep.from = S.jf.from || `${MIN_YEAR}-01-01`; S.rep.to = S.jf.to || today(); }
+        S.rep.includeUnapproved = S.jf.approval === 'not_approved';
+        S.view = 'reports'; render(); window.scrollTo(0, 0); toast('Filtres du Journal repris dans le rapport'); break;
+      }
+      case 'repFromJournal': {
+        S.rep.filter = { ...ST.emptyFilter(), ...JSON.parse(JSON.stringify(S.jf)), q: S.jQuery, from: '', to: '', approval: 'all', todo: false };
+        S.rep.filtersOpen = true; render(); toast('Filtres du Journal repris'); break;
+      }
+      case 'evoRange': S.evo.range = el.dataset.v; render(); break;
+      case 'evoUnit': S.evo.unit = el.dataset.v; render(); break;
+      case 'repKind': S.rep.kind = el.dataset.v; render(); break;
+      case 'repPreset': {
+        S.rep.preset = el.dataset.v;
+        if (S.rep.preset === 'custom' && !S.rep.from) { const r = presetRange('4w'); S.rep.from = r.from; S.rep.to = r.to; }
+        render(); break;
+      }
+      case 'repFilters': S.rep.filtersOpen = !S.rep.filtersOpen; render(); break;
+      case 'repPreview': openReportPreview(); break;
       case 'parent': S.settings.parent = el.dataset.p; await saveSettings(); render(); break;
       case 'saveChild': S.settings.childName = $('#childName').value.trim().slice(0, 40); await saveSettings(); render(); toast('Prénom enregistré'); break;
       case 'lockNow': lock(); break;
@@ -1206,7 +1429,7 @@
     stopSync();
     S.unlocked = false; S.loggedIn = false; S.session = null; S.sync = { status: 'idle', msg: '' };
     DEK = null;
-    S.events.clear(); S.days.clear(); S.drafts.clear(); S.settings = null;
+    S.events.clear(); S.days.clear(); S.drafts.clear(); S.settings = null; clearReport(); resetPhase5();
     closeSheets(); $('#modal-root').innerHTML = ''; $('#toast').hidden = true;
     view().innerHTML = '';
     $('#shell').hidden = true;
@@ -1219,7 +1442,7 @@
     S.unlocked = true; lastActivity = Date.now();
     $('#lock').hidden = true; $('#lock').innerHTML = '';
     $('#shell').hidden = false;
-    S.view = 'calendar'; S.selected = today(); S.month = null;
+    S.view = 'calendar'; S.selected = today(); S.month = null; resetPhase5();
     setupSync();
     try { S.session = await client.getSession(); } catch (e) { S.session = null; }
     S.loggedIn = !!S.session;
@@ -1325,7 +1548,7 @@
     }
     // Mise à jour en cours : si le navigateur a mélangé d'anciens et de nouveaux fichiers,
     // l'app ne démarre pas (aucune lecture ni écriture des données) et propose de recharger.
-    if (!JS || JS.VERSION !== APP_VERSION || !OR || OR.VERSION !== APP_VERSION) {
+    if (!JS || JS.VERSION !== APP_VERSION || !OR || OR.VERSION !== APP_VERSION || !ST || ST.VERSION !== APP_VERSION || !RP || RP.VERSION !== APP_VERSION) {
       document.body.innerHTML = '<main class="lock"><section class="card"><h1>Mise à jour en cours</h1>'
         + '<p>Une nouvelle version du journal s\'installe. Vos observations restent dans ce téléphone, rien n\'est effacé.</p>'
         + '<button type="button" class="btn block" id="jmReload">Recharger</button></section></main>';

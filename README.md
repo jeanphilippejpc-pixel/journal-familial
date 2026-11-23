@@ -28,7 +28,11 @@ Phase 4 (observations structurées) :
 - Catégories suggérées (8, fixes) selon les mots du récit ; questions facultatives (2 au plus) ; jugements et termes de diagnostic signalés.
 - Validation obligatoire : texte original, classement, sections et catégories modifiables, puis « Approuver ». L'app enregistre d'abord la fiche, puis envoie l'approbation seule, liée à la version relue ; le serveur refuse une approbation qui modifie la fiche, une nouvelle fiche envoyée déjà approuvée, et toute demande ancienne ou rejouée, puis fixe lui-même la date et le parent approbateur, retire l'approbation si le contenu de la fiche change (sections, note, date, heure, endroit, catégories…) sans nouvelle approbation, refuse toute approbation sans parent connecté, et verrouille le texte original.
 
-À venir : statistiques et PDF (phase 5).
+### Phase 5 : recherche, statistiques et rapports (0.5.0)
+- **Journal** : filtres combinables (période, type, intensité, catégories, endroit, parent, approbation, « À compléter ») et recherche de plusieurs mots, sans tenir compte des accents. « Créer un rapport avec ces filtres » reprend la sélection dans l'onglet Rapports.
+- **Évolution** : journées positives, avec difficultés et non évaluées (une journée sans couleur n'est jamais comptée comme une journée sans difficulté), tendances par semaine et par mois, catégories et contextes les plus fréquents (endroits, moments, jours), interventions associées au retour au calme le plus rapide — présentées comme une association observée, jamais comme une cause. Le nombre d'observations utilisées est toujours affiché.
+- **Rapports** : résumé d'une page ou rapport détaillé, aperçu avant impression, période et filtres, seulement les fiches approuvées par défaut (les autres, si on les ajoute, sont marquées), impressions des parents dans une section séparée des faits (option), textes originaux en annexe (option), masquage des renseignements personnels (activé par défaut).
+- **Confidentialité** : le rapport est construit dans le téléphone, uniquement dans la page ouverte. Il n'est ni envoyé, ni enregistré, ni mis en cache ; il est effacé à la fermeture de l'aperçu et au verrouillage. Le PDF est produit par la fenêtre d'impression du téléphone (« Enregistrer au format PDF »).
 
 ## Confidentialité
 

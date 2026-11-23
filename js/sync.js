@@ -437,7 +437,7 @@
     return { sync, resolveEvent, resolveDay, isRunning: () => !!running, needsUpdate: () => updateRequired };
   }
 
-  const api = { VERSION: '0.4.1', createClient, createEngine, eventToRow, rowToEvent, dayToRow, rowToDay, sameEvent, sameDay, summarize, diffCols, isPending, usesStructure, SyncError, EVENT_COLS, ALL_EVENT_COLS, STRUCT_COLS, CATEGORY_ORDER, DAY_COLS, FIELD_LABELS, describe };
+  const api = { VERSION: '0.5.0', createClient, createEngine, eventToRow, rowToEvent, dayToRow, rowToDay, sameEvent, sameDay, summarize, diffCols, isPending, usesStructure, SyncError, EVENT_COLS, ALL_EVENT_COLS, STRUCT_COLS, CATEGORY_ORDER, DAY_COLS, FIELD_LABELS, describe };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.JFSync = api;
 })(typeof window !== 'undefined' ? window : globalThis);
